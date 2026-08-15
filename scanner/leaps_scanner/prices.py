@@ -176,6 +176,46 @@ def fetch_daily_ohlcv(
     return FetchOutcome(frames=frames, failed=tuple(failed))
 
 
+def retry_fetch(
+    fetch: Callable[[], object],
+    *,
+    describe: str,
+    throttle: Throttle,
+    sleeper: Callable[[float], None] = time.sleep,
+    rng: random.Random | None = None,
+    max_retries: int = MAX_RETRIES,
+    is_empty: Callable[[object], bool] | None = None,
+):
+    """Run one throttled fetch with the standard backoff, returning None on defeat.
+
+    The generic sibling of `_fetch_batch_with_retries` for single-object
+    lookups (option chains, fundamentals, rates). The same yfinance quirk
+    applies everywhere: failure usually arrives as an empty result rather than
+    an exception, so `is_empty` results are retried exactly like errors.
+    """
+    jitter = rng if rng is not None else random.Random()
+    empty = is_empty if is_empty is not None else (lambda result: result is None)
+
+    for attempt in range(max_retries):
+        throttle.wait()
+        try:
+            result = fetch()
+        except Exception as exc:  # noqa: BLE001 - any transport error is retryable
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            if result is not None and not empty(result):
+                return result
+            reason = "empty response"
+
+        logger.warning(
+            "%s yielded nothing (attempt %d/%d): %s", describe, attempt + 1, max_retries, reason
+        )
+        if attempt < max_retries - 1:
+            sleeper(BACKOFF_BASE_SECONDS * (2**attempt) + jitter.uniform(0, BACKOFF_JITTER_SECONDS))
+
+    return None
+
+
 def _fetch_batch_with_retries(
     batch: Sequence[str],
     *,

@@ -15,6 +15,9 @@ if TYPE_CHECKING:  # pragma: no cover - import cost only paid by type checkers
 # arrive as a single oversized request.
 WRITE_CHUNK_SIZE = 200
 
+# PostgREST caps responses; reads page through explicit ranges of this size.
+READ_PAGE_SIZE = 1000
+
 STATUS_RUNNING = "running"
 STATUS_OK = "ok"
 STATUS_FAILED = "failed"
@@ -97,6 +100,44 @@ def write_scan_results(client: Client, rows: Sequence[dict[str, Any]]) -> None:
     """
     for chunk in _chunks(rows):
         client.table("scan_results").upsert(chunk, on_conflict="scan_id,symbol").execute()
+
+
+def upsert_iv_snapshots(client: Client, rows: Sequence[dict[str, Any]]) -> None:
+    """Append daily ATM IV snapshots, chunked; idempotent per (symbol, date)."""
+    for chunk in _chunks(rows):
+        client.table("iv_snapshots").upsert(chunk, on_conflict="symbol,snap_date").execute()
+
+
+def fetch_iv_history(
+    client: Client, *, since: date, until: date
+) -> dict[str, list[tuple[date, float]]]:
+    """Read iv_snapshots between two dates, per symbol, oldest first.
+
+    Paged through explicit ranges because PostgREST caps a single response;
+    ordering by (symbol, snap_date) keeps the pages stable while reading.
+    """
+    history: dict[str, list[tuple[date, float]]] = {}
+    offset = 0
+    while True:
+        response = (
+            client.table("iv_snapshots")
+            .select("symbol,snap_date,iv30")
+            .gte("snap_date", since.isoformat())
+            .lte("snap_date", until.isoformat())
+            .order("symbol")
+            .order("snap_date")
+            .range(offset, offset + READ_PAGE_SIZE - 1)
+            .execute()
+        )
+        rows = response.data or []
+        for row in rows:
+            if row.get("iv30") is None:
+                continue
+            snap_date = date.fromisoformat(row["snap_date"])
+            history.setdefault(row["symbol"], []).append((snap_date, float(row["iv30"])))
+        if len(rows) < READ_PAGE_SIZE:
+            return history
+        offset += READ_PAGE_SIZE
 
 
 def _chunks(rows: Sequence[dict[str, Any]], size: int = WRITE_CHUNK_SIZE):
