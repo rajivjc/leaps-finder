@@ -91,6 +91,27 @@ export type ScanResult = {
   earnings_dte: number | null;
 };
 
+/**
+ * One completed weekly bar with the overlays the charts draw (SPEC.md §8.2).
+ *
+ * `sma50`/`sma200` are the *daily* averages sampled at that week's last session,
+ * because §4's trend filter is defined on the daily averages — an average of
+ * weekly closes would be a different line entirely.
+ */
+export type WeeklyBar = {
+  symbol: string;
+  week_ending: string;
+  open: number | null;
+  high: number | null;
+  low: number | null;
+  close: number | null;
+  volume: number | null;
+  slow_k: number | null;
+  d: number | null;
+  sma50: number | null;
+  sma200: number | null;
+};
+
 export type IvSnapshot = {
   symbol: string;
   snap_date: string;
@@ -148,6 +169,7 @@ export type Database = {
       tickers: TableFor<Ticker>;
       scans: TableFor<Scan, "id">;
       scan_results: TableFor<ScanResult>;
+      weekly_bars: TableFor<WeeklyBar>;
       iv_snapshots: TableFor<IvSnapshot>;
       positions: TableFor<Position, "id">;
       alerts: TableFor<Alert, "id">;

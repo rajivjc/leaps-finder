@@ -187,6 +187,38 @@ def build_scan_row(
     }
 
 
+def build_weekly_bar_rows(
+    frames: Mapping[str, pd.DataFrame], symbols: Sequence[str], as_of: date
+) -> list[dict]:
+    """`weekly_bars` rows for the charts (SPEC.md §8.1-8.2).
+
+    Only symbols that produced signals are included: a symbol with too little
+    history to be scored has no row on the screener to click through from, so
+    persisting a chart for it would be storage without a reader.
+
+    `as_of` caps the newest bar written, so the series can never run ahead of
+    the scan that produced it no matter how long the run took or what the clock
+    did during it.
+    """
+    return [
+        {
+            "symbol": symbol,
+            "week_ending": bar.week_ending.isoformat(),
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+            "slow_k": bar.slow_k,
+            "d": bar.d,
+            "sma50": bar.sma50,
+            "sma200": bar.sma200,
+        }
+        for symbol in symbols
+        for bar in indicators.weekly_history(frames[symbol], through=as_of)
+    ]
+
+
 def resolve_as_of_date(signals_by_symbol: Mapping[str, Signals]) -> date:
     """The week the scan speaks for: the one most symbols completed.
 
@@ -532,6 +564,9 @@ def _run_full_scan(
     )
 
     db.write_scan_results(client, rows)
+    # The chart series behind §8.1's sparklines and §8.2's panels, from the same
+    # frames the signals were read from.
+    db.upsert_weekly_bars(client, build_weekly_bar_rows(outcome.frames, symbols, as_of))
     # Average volume comes from the history just fetched rather than a second
     # lookup, so it is always consistent with the bars the signals used.
     db.upsert_tickers(

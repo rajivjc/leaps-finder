@@ -15,6 +15,7 @@ lint:
 
 test:
 	cd scanner && ../$(VENV)/bin/pytest
+	cd apps/web && npm test
 
 # The same job GitHub Actions runs on Saturdays — needs scanner/.env (see .env.example).
 scan:

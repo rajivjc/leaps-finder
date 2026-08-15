@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from leaps_scanner import db, run_scan, scoring, universe
+from leaps_scanner import db, indicators, run_scan, scoring, universe
 from leaps_scanner.fundamentals import Fundamentals
 from leaps_scanner.indicators import Signals
 from leaps_scanner.options import OptionChain
@@ -450,6 +450,32 @@ class TestRunFullScan:
 
         rows = client.rows("scan_results", "upsert")[0]
         assert report.matches_count == sum(1 for row in rows if row["passes_wide"])
+
+    def test_weekly_bars_are_written_after_the_tickers_they_reference(self):
+        # weekly_bars.symbol has a foreign key to tickers.
+        client = FakeClient()
+
+        self.run(client)
+
+        tables = [name for name, _, _ in client.calls]
+        assert tables.index("tickers") < tables.index("weekly_bars")
+
+    def test_weekly_bars_cover_the_evaluated_symbols_and_end_at_the_scan_week(self):
+        client = FakeClient()
+
+        self.run(client)
+
+        rows = [row for chunk in client.rows("weekly_bars", "upsert") for row in chunk]
+        by_symbol: dict[str, list[dict]] = {}
+        for row in rows:
+            by_symbol.setdefault(row["symbol"], []).append(row)
+
+        assert sorted(by_symbol) == ["AAA", "BBB"]
+        for bars in by_symbol.values():
+            # The chart's last candle is the week the scan speaks for, so the
+            # chart and the row beside it cannot disagree.
+            assert max(bar["week_ending"] for bar in bars) == AS_OF.isoformat()
+            assert len(bars) <= indicators.WEEKLY_HISTORY_WEEKS
 
     def test_average_volume_is_written_back_to_tickers(self):
         client = FakeClient()

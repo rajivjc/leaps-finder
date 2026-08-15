@@ -23,15 +23,21 @@ Budget about fifteen minutes. Nothing here costs money — the whole design fits
 
 ## 2. Apply the migrations
 
-Open **SQL Editor → New query** in the dashboard and run these two files, in order, one at a
+Open **SQL Editor → New query** in the dashboard and run these files, in order, one at a
 time:
 
 1. [`supabase/migrations/0001_initial_schema.sql`](../supabase/migrations/0001_initial_schema.sql)
    — tables and indexes
 2. [`supabase/migrations/0002_rls.sql`](../supabase/migrations/0002_rls.sql)
    — row-level security policies and grants
+3. [`supabase/migrations/0003_weekly_bars.sql`](../supabase/migrations/0003_weekly_bars.sql)
+   — the weekly bar series behind the charts, with its own read policy
 
-Order matters: the second file references tables the first one creates.
+Order matters: each file references tables an earlier one creates.
+
+An existing project needs step 3 before the next scan and before deploying the web app: the
+scanner writes `weekly_bars` on every full scan, and the screener reads it for the card
+sparklines. Until the table exists, both fail loudly rather than silently drawing nothing.
 
 <details>
 <summary>Using the Supabase CLI instead</summary>
@@ -55,13 +61,14 @@ where relnamespace = 'public'::regnamespace and relkind = 'r'
 order by relname;
 ```
 
-All six tables must come back `true`:
+All seven tables must come back `true`:
 
 | table | who can read | who can write |
 |---|---|---|
 | `tickers` | anyone | scanner only |
 | `scans` | anyone | scanner only |
 | `scan_results` | anyone | scanner only |
+| `weekly_bars` | anyone | scanner only |
 | `iv_snapshots` | anyone | scanner only |
 | `positions` | the owner | the owner |
 | `alerts` | the owner | scanner creates, owner acknowledges |
