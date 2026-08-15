@@ -14,7 +14,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from leaps_scanner.config import ConfigError, load_settings
+from leaps_scanner.config import ConfigError, load_env_file, load_settings
 
 COMMANDS = ("full", "refresh")
 
@@ -44,6 +44,8 @@ def daily_refresh() -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+
+    load_env_file()
 
     try:
         load_settings()

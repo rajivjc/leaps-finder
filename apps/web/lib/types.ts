@@ -124,9 +124,20 @@ export type Alert = {
   acknowledged: boolean | null;
 };
 
-type TableFor<Row> = {
+/** Columns that accept null, and so may be omitted from an insert. */
+type NullableKeys<Row> = {
+  [K in keyof Row]-?: null extends Row[K] ? K : never;
+}[keyof Row];
+
+/**
+ * `Generated` names the non-null columns the database fills in itself (identity
+ * primary keys). Everything else non-null is required on insert — otherwise a
+ * missing NOT NULL column typechecks and fails at runtime as a PostgREST 400.
+ */
+type TableFor<Row, Generated extends keyof Row = never> = {
   Row: Row;
-  Insert: Partial<Row>;
+  Insert: Omit<Row, NullableKeys<Row> | Generated> &
+    Partial<Pick<Row, NullableKeys<Row> | Generated>>;
   Update: Partial<Row>;
   Relationships: [];
 };
@@ -135,11 +146,11 @@ export type Database = {
   public: {
     Tables: {
       tickers: TableFor<Ticker>;
-      scans: TableFor<Scan>;
+      scans: TableFor<Scan, "id">;
       scan_results: TableFor<ScanResult>;
       iv_snapshots: TableFor<IvSnapshot>;
-      positions: TableFor<Position>;
-      alerts: TableFor<Alert>;
+      positions: TableFor<Position, "id">;
+      alerts: TableFor<Alert, "id">;
     };
     Views: Record<never, never>;
     Functions: Record<never, never>;

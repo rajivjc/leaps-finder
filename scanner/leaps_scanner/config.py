@@ -10,13 +10,35 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 SUPABASE_URL_VAR = "SUPABASE_URL"
 SUPABASE_SERVICE_KEY_VAR = "SUPABASE_SERVICE_KEY"
 
+# scanner/.env — resolved from the package, so local runs work from any directory.
+DEFAULT_ENV_FILE = Path(__file__).resolve().parents[1] / ".env"
+
 
 class ConfigError(RuntimeError):
     """Raised when required environment configuration is missing."""
+
+
+def load_env_file(path: Path | None = None) -> bool:
+    """Load `scanner/.env` into the process environment for local runs.
+
+    A no-op in GitHub Actions, where the file does not exist and the values
+    arrive as secrets. Never overrides a variable that is already set, so the
+    real environment always wins over a stale file. Returns whether a file was
+    read.
+    """
+    from dotenv import load_dotenv
+
+    target = DEFAULT_ENV_FILE if path is None else path
+    if not target.is_file():
+        return False
+
+    load_dotenv(target, override=False)
+    return True
 
 
 @dataclass(frozen=True)

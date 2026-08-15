@@ -56,6 +56,12 @@ create policy alerts_owner_select on alerts
   );
 
 -- The owner may only acknowledge alerts; the scanner (service key) creates them.
+-- RLS scopes rows, not columns, so the column restriction is a grant: without it
+-- the policy below would also let the owner rewrite an alert's kind or message
+-- and quietly edit the exit-signal record the scanner wrote.
+revoke update on alerts from anon, authenticated;
+grant update (acknowledged) on alerts to authenticated;
+
 drop policy if exists alerts_owner_update on alerts;
 create policy alerts_owner_update on alerts
   for update using (
