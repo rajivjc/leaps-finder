@@ -1,0 +1,26 @@
+@import "tailwindcss";
+
+/* Clean light theme (SPEC.md §8). No score-inflating visual tricks: neutral
+   below 60, and no green-at-70 threshold anywhere. */
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+  --muted: #6b7280;
+  --border: #e5e7eb;
+  --surface: #f9fafb;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted: var(--muted);
+  --color-border-subtle: var(--border);
+  --color-surface: var(--surface);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+}

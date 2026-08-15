@@ -1,0 +1,40 @@
+[project]
+name = "leaps-scanner"
+version = "0.1.0"
+description = "LEAPS Finder scanner: universe, signals, option economics, scoring."
+requires-python = ">=3.11"
+dependencies = [
+    "yfinance>=0.2.54",
+    "curl_cffi>=0.7",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "supabase>=2.15",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+leaps-scan = "leaps_scanner.run_scan:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["leaps_scanner*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
