@@ -69,12 +69,28 @@ make lint     # ruff + eslint + tsc
 make test     # pytest
 ```
 
+For the scan to run in CI, add `SUPABASE_URL` and `SUPABASE_SERVICE_KEY` as **Actions**
+secrets (Settings → Secrets and variables → Actions). The weekly job can then be triggered by
+hand from the Actions tab; it otherwise runs Saturdays at 02:00 UTC.
+
+## How a scan decides
+
+The scanner reads the bundled S&P 500 seed list, keeps names at $50B or more of market cap,
+pulls two years of daily bars for each, and evaluates them at the close of the **last completed
+week**. The in-progress week is dropped before any signal is computed, so a Tuesday rerun
+reproduces Saturday's numbers exactly — nothing repaints.
+
+A symbol without enough history to define every signal is excluded rather than approximated,
+and a 10-week window with no range yields no stochastic rather than an invented midpoint. If
+more than 20% of the universe ends up missing for any reason, the scan is recorded as `failed`
+and the screener will not display it. Partial data never looks complete.
+
 ## Status
 
 Built milestone by milestone against [SPEC.md §11](SPEC.md).
 
 - [x] **M1 Scaffold** — monorepo, migrations + RLS, Next.js shell with Supabase client, CI
-- [ ] **M2 Scanner core** — universe, prices, indicators, `scan_results` writes
+- [x] **M2 Scanner core** — universe, prices, indicators, `scan_results` writes, weekly cron
 - [ ] **M3 Options + scoring** — chain selection, Black-Scholes delta, IV snapshots, presets
 - [ ] **M4 Frontend** — screener, ticker detail, compare
 - [ ] **M5 Risk** — auth, positions, size calculator, exit monitor and alerts

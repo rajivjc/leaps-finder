@@ -1,0 +1,40 @@
+name: Weekly scan
+
+# Saturday 02:00 UTC — after Friday's US close, so the week's bars are complete
+# (SPEC.md §9). Manual dispatch is there for the first run and for re-runs after
+# a Yahoo outage.
+on:
+  schedule:
+    - cron: "0 2 * * SAT"
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    name: Full scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: scanner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      # Exits non-zero when the scan is recorded as failed, so a partial run
+      # shows red here rather than passing quietly.
+      - name: Run full scan
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python -m leaps_scanner.run_scan full
