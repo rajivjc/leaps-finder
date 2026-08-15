@@ -96,25 +96,156 @@ cushion       = (target_adj - breakeven) / breakeven`}</Formula>
           + 0.15 * Valuation
           + 0.15 * Entry`}</Formula>
         <p>
-          The trend subscore carries an extension penalty: a stock more than 20% above its 50-day
-          average scores zero on that gate. Parabolic is not better. A quality metric that is
-          missing is excluded from its mean and flagged in the interface rather than being
-          quietly treated as average.
+          Every subscore is built from one helper, <code className="font-mono">clip_map</code>, a
+          piecewise-linear ramp: below <code className="font-mono">x0</code> it is 0, above{" "}
+          <code className="font-mono">x1</code> it is 100, and in between it interpolates.
+        </p>
+        <Formula>{`clip_map(x, x0, x1) = 100 * clamp((x - x0) / (x1 - x0), 0, 1)`}</Formula>
+
+        <p>
+          <strong className="text-[var(--foreground)]">Trend (weight 0.25)</strong> — the mean of
+          three terms, then multiplied by an extension penalty:
+        </p>
+        <Formula>{`mean of  clip_map(close / sma200 - 1, 0, 0.25)
+         clip_map(sma50 / sma200 - 1, 0, 0.10)
+         clip_map(share of last 60 sessions closing above SMA50, 0.5, 1.0)
+
+penalty = min(1, clip_map(0.20 - (close / sma50 - 1), 0, 0.10) / 100)`}</Formula>
+        <p>
+          The penalty is why a runaway chart does not top this list: a stock more than 20% above
+          its 50-day average scores zero on that gate outright. Parabolic is not better.
+        </p>
+
+        <p>
+          <strong className="text-[var(--foreground)]">Quality (0.25)</strong> — the mean of five
+          terms. A metric that is missing is excluded from the mean rather than being scored as
+          average, and the omission is flagged rather than hidden:
+        </p>
+        <Formula>{`mean of  clip_map(operating margin, 0.05, 0.30)
+         clip_map(return on equity, 0.08, 0.30)
+         clip_map(3 - net debt / EBITDA, 0, 3)     <- net cash scores 100
+         clip_map(revenue growth TTM YoY, 0, 0.20)
+         clip_map(free cash flow margin, 0, 0.20)`}</Formula>
+
+        <p>
+          <strong className="text-[var(--foreground)]">Option economics (0.20)</strong> — cheap,
+          liquid and calm scores well:
+        </p>
+        <Formula>{`mean of  clip_map(50 - iv_rank, 0, 50)
+         clip_map(0.40 - iv30, 0, 0.25)
+         clip_map(0.30 - cost_pct_spot, 0, 0.15)
+         clip_map(0.10 - spread_pct, 0, 0.08)
+         clip_map(open interest, 100, 2000)`}</Formula>
+
+        <p>
+          <strong className="text-[var(--foreground)]">Valuation and upside (0.15)</strong> — the
+          analyst mean target is cut by 40% before it is believed at all:
+        </p>
+        <Formula>{`upside_adj = 0.6 * (analyst_target / spot - 1)
+
+mean of  clip_map(upside_adj, 0, 0.25)
+         inverted forward-P/E percentile within this scan's universe`}</Formula>
+
+        <p>
+          <strong className="text-[var(--foreground)]">Entry (0.15)</strong> — where in the zone
+          the oscillator sits, and how fresh the turn is:
+        </p>
+        <Formula>{`zone position : peaks over slowK 25-45, falling linearly to 0 at 20 and at 70
+freshness    : 100 if slowK crossed above D within the last 2 completed weeks
+                60 if within 4
+                30 otherwise`}</Formula>
+        <p>
+          A subscore that cannot be computed is null, and a composite missing any of its five
+          terms is null too — shown as an em dash. It is never filled in with a zero, which would
+          be a claim that the factor was measured and found to be as bad as possible.
+        </p>
+      </Section>
+
+      <Section title="Implied volatility rank">
+        <p>
+          IV rank is computed from this project&rsquo;s own daily ATM snapshots, not bought from
+          anyone:
+        </p>
+        <Formula>{`iv_rank = (iv30 - min(iv30 over 252 snapshots)) / (max - min)`}</Formula>
+        <p>
+          That range needs history this project has not accumulated yet. Until a symbol has at
+          least 120 snapshots of its own, its status is <em>warming up</em> and a substitute
+          stands in on the same 0–100 scale: the cross-sectional percentile of{" "}
+          <code className="font-mono">iv30 / rv20</code> across the scanned universe, where{" "}
+          <code className="font-mono">rv20</code> is 20-day realised volatility, annualised. The
+          preset thresholds apply to whichever value is in force.
         </p>
         <p>
-          IV rank is computed from this project&rsquo;s own daily snapshots. Until a symbol has
-          accumulated at least 120 of them, it is labelled <em>warming up</em> and a
-          cross-sectional proxy stands in — the badge is shown, never hidden.
+          Every symbol will read <em>warming up</em> for roughly the first six months of this
+          project&rsquo;s life. The badge is always shown. A substitute labelled as the real thing
+          would be the most quietly misleading number on the page.
+        </p>
+      </Section>
+
+      <Section title="Presets">
+        <p>
+          The presets are hard filters applied before ranking — they decide which names appear at
+          all, and the score only orders what survives. The tiers nest: everything that clears
+          Strict also clears Balanced and Wide.
+        </p>
+        <div className="overflow-x-auto rounded-md border border-[var(--border)]">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="border-b border-[var(--border)] bg-[var(--surface)] text-left">
+                <th className="px-3 py-2 font-medium">Filter</th>
+                <th className="px-3 py-2 font-medium">Strict</th>
+                <th className="px-3 py-2 font-medium">Balanced</th>
+                <th className="px-3 py-2 font-medium">Wide open</th>
+              </tr>
+            </thead>
+            <tbody className="font-mono">
+              {[
+                ["Trend pass", "required", "required", "required"],
+                ["slowK zone", "20–55 + turning up", "20–70 + turning up", "10–80"],
+                ["IV rank", "≤ 30", "≤ 50", "—"],
+                ["Earnings distance", "≥ 30d", "≥ 14d", "—"],
+                ["Spread % of mid", "≤ 5%", "≤ 8%", "≤ 12%"],
+                ["Open interest", "≥ 500", "≥ 200", "≥ 100"],
+                ["Quality", "all metrics present, ≥ 60", "≥ 45", "—"],
+              ].map(([filter, strict, balanced, wide]) => (
+                <tr key={filter} className="border-b border-[var(--border)] last:border-0">
+                  <td className="px-3 py-1.5 font-sans">{filter}</td>
+                  <td className="px-3 py-1.5">{strict}</td>
+                  <td className="px-3 py-1.5">{balanced}</td>
+                  <td className="px-3 py-1.5">{wide}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <p>
+          A gate whose input is unknown fails rather than passes. A symbol with no earnings date
+          cannot clear &ldquo;earnings ≥ 30 days&rdquo;, and a symbol with no valid contract has no
+          spread or open interest to clear any tier with.
         </p>
       </Section>
 
       <Section title="Risk discipline">
+        <p>Position size is mechanical:</p>
+        <Formula>{`max_premium_dollars = 0.03 * account_equity
+max_contracts       = floor(max_premium_dollars / (mid * 100))`}</Formula>
         <p>
-          Position size is capped at 3% of account equity in premium per trade, with a 15% cap
-          across the whole sleeve, at most two positions per sector, and five open at a time.
-          Exits are mechanical: a trend break, a weekly stochastic cross below 20, premium down
-          50% from entry, or fewer than 180 days to expiry. A sleeve drawdown of 8% or more stops
-          new entries for four weeks.
+          Alongside that: at most 15% of equity in open premium across the whole sleeve, at most
+          two positions per sector, and five open at a time. Those are warnings rather than hard
+          blocks — they can be overridden deliberately, and the override is logged.
+        </p>
+        <p>Exits are mechanical too, and evaluated by the scanner rather than by judgement:</p>
+        <Formula>{`trend break   : close < SMA200 or SMA50 < SMA200        (daily)
+stochastic    : weekly slowK crosses below 20          (weekly)
+premium stop  : current mid <= 50% of entry premium    (daily)
+time exit     : DTE < 180                              (daily)
+earnings      : earnings within 21d (informational)    (daily)
+circuit break : sleeve loss >= 8% of entry equity
+                -> no new entries for four weeks`}</Formula>
+        <p>
+          &ldquo;Crosses below 20&rdquo; means exactly that — a transition, not a state. A
+          stochastic that has been sitting under 20 for six weeks is not firing an exit signal
+          every week.
         </p>
       </Section>
 
@@ -125,6 +256,13 @@ cushion       = (target_adj - breakeven) / breakeven`}</Formula>
           can disappear without notice. Option quotes in particular may be stale outside market
           hours, and a mid-price is not a fill. Scans that lose more than a fifth of the universe
           to fetch failures are recorded as failed rather than presented as complete.
+        </p>
+        <p>
+          Everything on this site is a stored result of the weekly scan, including the charts — no
+          page fetches a quote when you open it. The date at the top of each page is the Friday the
+          numbers describe, and between Saturday scans they do not move. Weekly candles, the
+          stochastic panel and the card sparklines are all drawn from series the scanner wrote, so
+          the chart and the checklist beside it are always computed from the same bars.
         </p>
       </Section>
 

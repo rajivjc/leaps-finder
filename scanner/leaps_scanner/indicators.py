@@ -34,6 +34,12 @@ SESSIONS_52W = 252
 # SPEC.md §6 Trend: share of the last 60 sessions closing above the SMA50.
 SHARE_SESSIONS = 60
 
+# Completed weeks of history persisted for the charts (SPEC.md §8.2 asks for ~1y
+# of weekly candles). Two years is kept because the SMA200 overlay needs 200
+# daily sessions before it is defined at all: a 1-year chart with a full SMA200
+# line requires roughly a year of bars on top of that warm-up.
+WEEKLY_HISTORY_WEEKS = 104
+
 # Bars needed before the last stochastic value is fully defined: the %K window,
 # then two more for each 3-period average.
 MIN_WEEKLY_BARS = STOCH_K_PERIOD + (STOCH_K_SMOOTH - 1) + (STOCH_D_SMOOTH - 1)
@@ -67,6 +73,24 @@ class Signals:
     # (1 = on the latest bar; None = never in the available history).
     share_above_sma50_60d: float
     weeks_since_cross_up: int | None
+
+
+@dataclass(frozen=True)
+class WeeklyBar:
+    """One completed weekly bar plus the overlays the charts draw on it (§8.2)."""
+
+    week_ending: date
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float | None
+    # Null wherever the indicator is not yet defined over the fetched window;
+    # the chart draws a gap there rather than a fabricated value.
+    slow_k: float | None
+    d: float | None
+    sma50: float | None
+    sma200: float | None
 
 
 def sma(series: pd.Series, window: int) -> pd.Series:
@@ -179,6 +203,76 @@ def crosses_above(series: pd.Series, level: float) -> bool:
 
     previous, current = float(clean.iloc[-2]), float(clean.iloc[-1])
     return previous <= level and current > level
+
+
+def _finite(value: object) -> float | None:
+    """Coerce to float, mapping missing and non-finite alike to None.
+
+    NaN is what pandas returns for an indicator that is not defined yet; it is
+    also not representable in JSON. A null column says "not defined" honestly,
+    where a zero would read as a real reading of zero.
+    """
+    if value is None:
+        return None
+    number = float(value)  # type: ignore[arg-type]
+    return number if np.isfinite(number) else None
+
+
+def weekly_history(
+    daily: pd.DataFrame,
+    today: date | None = None,
+    weeks: int = WEEKLY_HISTORY_WEEKS,
+) -> list[WeeklyBar]:
+    """The chart series for one symbol: completed weekly bars, newest last.
+
+    Same inputs and same cutoff as `evaluate`, so the last bar returned here is
+    the bar the scan's signals were read from — the chart cannot disagree with
+    the row beside it.
+
+    The stochastic and the moving averages are computed over the *whole*
+    available history and only then sliced to `weeks`. Slicing first would leave
+    the oldest 12 bars of the chart undefined, and would make a bar's value
+    depend on how much history happened to be fetched.
+    """
+    if daily.empty:
+        return []
+
+    daily = daily.sort_index()
+    weekly = completed_weekly_bars(daily, today=today)
+    if weekly.empty:
+        return []
+
+    stoch = slow_stochastic(weekly)
+    close = daily["Close"]
+    # §8.2 overlays the daily SMA50/200 that §4's trend filter is defined on, not
+    # an average of weekly closes. Each weekly bar is labelled with its Friday,
+    # which may be a holiday or fall past the last session, so `ffill` takes the
+    # last daily session at or before the label — the same reading `evaluate`
+    # uses for the current week.
+    sma50 = sma(close, SMA_FAST).reindex(weekly.index, method="ffill")
+    sma200 = sma(close, SMA_SLOW).reindex(weekly.index, method="ffill")
+
+    bars: list[WeeklyBar] = []
+    for timestamp, row in weekly.tail(weeks).iterrows():
+        ohlc = [_finite(row[column]) for column in ("Open", "High", "Low", "Close")]
+        if any(value is None for value in ohlc):
+            continue  # a bar without a full quote is not a candle worth drawing
+        bar_open, bar_high, bar_low, bar_close = ohlc
+        bars.append(
+            WeeklyBar(
+                week_ending=timestamp.date(),
+                open=bar_open,
+                high=bar_high,
+                low=bar_low,
+                close=bar_close,
+                volume=_finite(row["Volume"]),
+                slow_k=_finite(stoch["slow_k"].get(timestamp)),
+                d=_finite(stoch["d"].get(timestamp)),
+                sma50=_finite(sma50.get(timestamp)),
+                sma200=_finite(sma200.get(timestamp)),
+            )
+        )
+    return bars
 
 
 def evaluate(daily: pd.DataFrame, today: date | None = None) -> Signals:

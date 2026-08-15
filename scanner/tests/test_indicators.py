@@ -280,3 +280,65 @@ class TestScoringInputs:
         signals = indicators.evaluate(daily_frame(500, closes=closes))
 
         assert signals.share_above_sma50_60d == pytest.approx(0.0)
+
+
+class TestWeeklyHistory:
+    """The chart series (SPEC.md §8.2). Its load-bearing property is agreement:
+    the last bar must be the bar the scan's signals were read from."""
+
+    def test_last_bar_matches_the_signals_read_from_the_same_frame(self):
+        daily = daily_frame(500)
+
+        signals = indicators.evaluate(daily)
+        last = indicators.weekly_history(daily)[-1]
+
+        assert last.week_ending == signals.as_of_date
+        assert last.close == pytest.approx(signals.spot)
+        assert last.slow_k == pytest.approx(signals.stoch_k)
+        assert last.d == pytest.approx(signals.stoch_d)
+        assert last.sma50 == pytest.approx(signals.sma50)
+        assert last.sma200 == pytest.approx(signals.sma200)
+
+    def test_in_progress_week_is_excluded(self):
+        # Wednesday: the current week is still trading, so it must not be drawn.
+        bars = indicators.weekly_history(daily_frame(400, end="2026-08-12"))
+
+        assert bars[-1].week_ending.isoformat() == "2026-08-07"
+
+    def test_sma_overlay_is_the_daily_average_not_an_average_of_weekly_closes(self):
+        # A 50-period average of weekly closes would be a ~1-year line; §8.2
+        # overlays the daily SMA50 that §4's trend filter is defined on.
+        daily = daily_frame(500)
+
+        last = indicators.weekly_history(daily)[-1]
+
+        assert last.sma50 == pytest.approx(daily["Close"].tail(50).mean())
+        assert last.sma200 == pytest.approx(daily["Close"].tail(200).mean())
+
+    def test_slicing_does_not_truncate_the_indicator_warm_up(self):
+        # The oldest bar of a 10-week window still carries a stochastic, because
+        # the series is computed over the full history and sliced afterwards.
+        bars = indicators.weekly_history(daily_frame(500), weeks=10)
+
+        assert len(bars) == 10
+        assert all(bar.slow_k is not None and bar.d is not None for bar in bars)
+
+    def test_undefined_indicators_are_null_rather_than_zero(self):
+        # 60 sessions: enough for an SMA50, never enough for an SMA200, and the
+        # first weekly bars precede the stochastic's 12-bar warm-up.
+        bars = indicators.weekly_history(daily_frame(60))
+
+        assert bars, "60 sessions still produce weekly candles"
+        assert all(bar.sma200 is None for bar in bars)
+        assert bars[0].slow_k is None
+        assert all(bar.close is not None for bar in bars)
+
+    def test_history_is_ordered_oldest_first_and_capped(self):
+        bars = indicators.weekly_history(daily_frame(900))
+
+        assert len(bars) == indicators.WEEKLY_HISTORY_WEEKS
+        assert [bar.week_ending for bar in bars] == sorted(bar.week_ending for bar in bars)
+
+    def test_empty_history_yields_no_bars_rather_than_raising(self):
+        # Unlike `evaluate`, a chart with nothing to draw is not an error.
+        assert indicators.weekly_history(daily_frame(0)) == []

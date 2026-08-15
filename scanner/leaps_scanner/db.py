@@ -102,6 +102,17 @@ def write_scan_results(client: Client, rows: Sequence[dict[str, Any]]) -> None:
         client.table("scan_results").upsert(chunk, on_conflict="scan_id,symbol").execute()
 
 
+def upsert_weekly_bars(client: Client, rows: Sequence[dict[str, Any]]) -> None:
+    """Write the weekly bar history the charts read (SPEC.md §8.2), chunked.
+
+    Idempotent per (symbol, week_ending): a rerun rewrites the same bars, and a
+    revision to a past week (a late Yahoo correction) overwrites rather than
+    duplicating.
+    """
+    for chunk in _chunks(rows):
+        client.table("weekly_bars").upsert(chunk, on_conflict="symbol,week_ending").execute()
+
+
 def upsert_iv_snapshots(client: Client, rows: Sequence[dict[str, Any]]) -> None:
     """Append daily ATM IV snapshots, chunked; idempotent per (symbol, date)."""
     for chunk in _chunks(rows):

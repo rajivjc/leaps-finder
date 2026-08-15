@@ -8,6 +8,20 @@
   --muted: #6b7280;
   --border: #e5e7eb;
   --surface: #f9fafb;
+
+  /* Score bars. Deliberately not a red-amber-green ramp: the spec's threshold
+     is "neutral below 60", and the fill above it is a muted slate rather than a
+     green, so a high score reads as a longer bar and not as a buy signal. */
+  --track: #eef1f5;
+  --score-low: #cbd5e1;
+  --score-high: #64748b;
+
+  /* Pass / fail on the filter checklist, and the amber earnings flag (§7). */
+  --pass: #15803d;
+  --fail: #b91c1c;
+  --warn-bg: #fef3c7;
+  --warn-fg: #92400e;
+  --warn-border: #fcd34d;
 }
 
 @theme inline {
