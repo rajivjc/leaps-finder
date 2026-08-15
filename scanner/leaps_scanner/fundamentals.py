@@ -62,6 +62,20 @@ class Fundamentals:
 EMPTY = Fundamentals()
 
 
+@dataclass(frozen=True)
+class FundamentalsOutcome:
+    """Per-symbol snapshots plus the symbols whose fetch failed outright.
+
+    A failed symbol still maps to an empty snapshot in `results` so the
+    pipeline can index it, but it is named in `failed` — the scan counts
+    those toward its incomplete-data ceiling instead of letting a wholesale
+    Yahoo outage masquerade as a universe of companies with no financials.
+    """
+
+    results: dict[str, Fundamentals]
+    failed: tuple[str, ...]
+
+
 def _number(info: Mapping, key: str) -> float | None:
     value = info.get(key)
     if isinstance(value, bool) or not isinstance(value, int | float):
@@ -138,17 +152,19 @@ def fetch_fundamentals(
     throttle: Throttle | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
-) -> dict[str, Fundamentals]:
+) -> FundamentalsOutcome:
     """Fetch fundamentals per symbol, throttled, retrying empty payloads.
 
-    A symbol that still has nothing after the retries keeps an empty snapshot:
-    its Quality metrics are simply missing, which §6 already knows how to
-    handle. Missing fundamentals never fail the scan the way missing prices or
-    chains do.
+    A symbol that still has nothing after the retries keeps an empty snapshot
+    (its metrics are simply missing, which §6 knows how to handle) *and* is
+    reported in `failed`: an all-None payload after three retries is a fetch
+    failure, not a company without financials, and the scan must count it as
+    incomplete data rather than quietly scoring on nulls.
     """
     limiter = throttle if throttle is not None else Throttle(sleeper=sleeper)
 
     results: dict[str, Fundamentals] = {}
+    failed: list[str] = []
     for symbol in symbols:
         fetched = retry_fetch(
             lambda symbol=symbol: fetcher(symbol),
@@ -158,6 +174,8 @@ def fetch_fundamentals(
             rng=rng,
             is_empty=lambda snapshot: snapshot.is_empty,
         )
+        if fetched is None:
+            failed.append(symbol)
         results[symbol] = fetched if fetched is not None else EMPTY
 
-    return results
+    return FundamentalsOutcome(results=results, failed=tuple(failed))

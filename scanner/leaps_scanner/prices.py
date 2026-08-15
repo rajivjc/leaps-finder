@@ -199,11 +199,15 @@ def retry_fetch(
     for attempt in range(max_retries):
         throttle.wait()
         try:
+            # The emptiness probe stays inside the try: a malformed result
+            # that makes it raise is exactly as retryable as a transport
+            # error, and must never escape to abort the caller's whole run.
             result = fetch()
+            usable = result is not None and not empty(result)
         except Exception as exc:  # noqa: BLE001 - any transport error is retryable
             reason = f"{type(exc).__name__}: {exc}"
         else:
-            if result is not None and not empty(result):
+            if usable:
                 return result
             reason = "empty response"
 

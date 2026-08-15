@@ -37,13 +37,16 @@ logger = logging.getLogger(__name__)
 COMMANDS = ("full", "refresh")
 
 # SPEC.md §9: losing more than a fifth of the universe means the scan does not
-# get to call itself complete. Option-chain fetch failures count toward the
-# same ceiling — a row without option economics is partial data too.
+# get to call itself complete. Option-chain and fundamentals fetch failures
+# count toward the same ceiling — a row without option economics or with a
+# silently-empty financials payload is partial data too.
 MAX_MISSING_FRACTION = 0.20
 
 # Calendar window fetched for IV rank; scoring then uses the trailing
-# IV_RANK_WINDOW snapshots within it.
-IV_HISTORY_DAYS = 365
+# IV_RANK_WINDOW snapshots within it. 252 snapshots at M5's daily cadence
+# (5/week minus holidays) span ~367 calendar days, so the fetch window needs
+# headroom beyond a year or it would silently truncate the rank window.
+IV_HISTORY_DAYS = 420
 
 M3_NOTE = "M3: five filters, option economics and scoring; exit monitor lands in M5."
 
@@ -60,6 +63,7 @@ class ScanReport:
     status: str
     notes: str
     option_failures: int = 0
+    fundamentals_failures: int = 0
 
     @property
     def ok(self) -> bool:
@@ -209,20 +213,31 @@ def expected_as_of_date(today: date | None = None) -> date:
     return reference - timedelta(days=(reference.weekday() - 4) % 7)
 
 
-def assess(universe_count: int, evaluated_count: int, option_failures: int = 0) -> tuple[str, str]:
+def assess(
+    universe_count: int,
+    evaluated_count: int,
+    option_failures: int = 0,
+    fundamentals_failures: int = 0,
+    data_failures: int | None = None,
+) -> tuple[str, str]:
     """Decide the scan's status from its coverage (SPEC.md §9).
 
-    Both kinds of gap are partial data: symbols with no price history at all,
-    and evaluated symbols whose option chains never arrived. (A chain that
-    arrived but contained no valid contract is a market fact, recorded as
-    nulls, and does not count here.)
+    Every kind of gap is partial data: symbols with no price history, and
+    evaluated symbols whose option chains or fundamentals payloads never
+    arrived. (A chain that arrived but contained no valid contract is a
+    market fact, recorded as nulls, and does not count here.) `data_failures`
+    is the deduplicated count of evaluated symbols with either fetch failure;
+    it defaults to the sum when the caller has no overlap to deduplicate.
     """
     missing = universe_count - evaluated_count
-    incomplete = missing + option_failures
+    if data_failures is None:
+        data_failures = option_failures + fundamentals_failures
+    incomplete = missing + data_failures
     fraction = incomplete / universe_count if universe_count else 1.0
     detail = (
         f"{missing}/{universe_count} symbols without price history, "
-        f"{option_failures} evaluated without option data. {M3_NOTE}"
+        f"{option_failures} evaluated without option data, "
+        f"{fundamentals_failures} without fundamentals. {M3_NOTE}"
     )
 
     if universe_count == 0:
@@ -259,20 +274,15 @@ def resolve_iv_contexts(
 ) -> dict[str, IvContext]:
     """§6 IV rank, cross-sectional pass.
 
-    A symbol with ≥ 120 snapshots in the trailing window gets the real rank;
-    everyone else is warming up and gets the cross-sectional percentile of
-    iv30/rv20 substituted in its place (same scale, same preset thresholds).
-    The current snapshot is appended in memory when the history read predates
-    this scan's write.
+    A symbol with a current iv30 and ≥ 120 snapshots in the trailing window
+    gets the real rank; everyone else is warming up and gets the
+    cross-sectional percentile of iv30/rv20 substituted in its place (same
+    scale, same preset thresholds). A symbol with *no* current iv30 never
+    gets a rank at all — §6 defines the rank over the current value, and
+    stamping last week's rank `ok` in a row whose iv30 is null would assert
+    an IV fact the scan does not have. The current snapshot is appended in
+    memory when the history read predates this scan's write.
     """
-    values_by_symbol: dict[str, list[float]] = {}
-    for symbol in symbols:
-        series = list(history.get(symbol, []))
-        iv30 = iv30_by_symbol.get(symbol)
-        if iv30 is not None and (not series or series[-1][0] != as_of):
-            series.append((as_of, iv30))
-        values_by_symbol[symbol] = [value for _, value in series]
-
     ratios: dict[str, float] = {}
     for symbol in symbols:
         iv30 = iv30_by_symbol.get(symbol)
@@ -283,12 +293,16 @@ def resolve_iv_contexts(
 
     contexts: dict[str, IvContext] = {}
     for symbol in symbols:
-        values = values_by_symbol[symbol]
-        rank = (
-            scoring.iv_rank(values)
-            if len(values[-scoring.IV_RANK_WINDOW :]) >= scoring.IV_RANK_MIN_SNAPSHOTS
-            else None
-        )
+        iv30 = iv30_by_symbol.get(symbol)
+        rank = None
+        if iv30 is not None:
+            series = list(history.get(symbol, []))
+            if not series or series[-1][0] != as_of:
+                series.append((as_of, iv30))
+            values = [value for _, value in series]
+            if len(values[-scoring.IV_RANK_WINDOW :]) >= scoring.IV_RANK_MIN_SNAPSHOTS:
+                rank = scoring.iv_rank(values)
+
         if rank is not None:
             contexts[symbol] = IvContext(value=rank, status=scoring.IV_RANK_STATUS_OK)
         elif symbol in ratios:
@@ -400,37 +414,48 @@ def _run_full_scan(
     as_of = resolve_as_of_date(signals_by_symbol) if signals_by_symbol else expected_as_of_date()
     symbols = sorted(signals_by_symbol)
 
-    funds = fundamentals.fetch_fundamentals(symbols, fetcher=fundamentals_fetcher, sleeper=sleeper)
-
-    # §5.2's r, fetched once. Without it no delta is computable for anyone, so
-    # a scan that cannot get it aborts (and is recorded as failed) rather than
-    # writing a universe of half-rows.
-    rate = prices.retry_fetch(
-        risk_free_fetcher,
-        describe="risk-free rate (^IRX)",
-        throttle=prices.Throttle(sleeper=sleeper),
-        sleeper=sleeper,
+    funds_outcome = fundamentals.fetch_fundamentals(
+        symbols, fetcher=fundamentals_fetcher, sleeper=sleeper
     )
-    if rate is None:
-        raise RuntimeError("risk-free rate (^IRX) unavailable; option deltas cannot be computed")
+    funds = funds_outcome.results
+    if funds_outcome.failed:
+        logger.warning("fundamentals fetch failed for %d symbols", len(funds_outcome.failed))
 
-    options_outcome = options.fetch_options(
-        [
-            options.OptionQuery(
-                symbol=symbol,
-                spot=signals_by_symbol[symbol].spot,
-                dividend_yield=funds[symbol].dividend_yield,
+    options_outcome = options.OptionsOutcome(results={}, failed=())
+    if symbols:
+        # §5.2's r, fetched once. Without it no delta is computable for
+        # anyone, so a scan that cannot get it aborts (and is recorded as
+        # failed) rather than writing a universe of half-rows. Skipped
+        # entirely when nothing survived to be scored, so an empty-universe
+        # run reports the real root cause instead of a rate error.
+        rate = prices.retry_fetch(
+            risk_free_fetcher,
+            describe="risk-free rate (^IRX)",
+            throttle=prices.Throttle(sleeper=sleeper),
+            sleeper=sleeper,
+        )
+        if rate is None:
+            raise RuntimeError(
+                "risk-free rate (^IRX) unavailable; option deltas cannot be computed"
             )
-            for symbol in symbols
-        ],
-        today=as_of,
-        r=rate,
-        expiries_fetcher=expiries_fetcher,
-        chain_fetcher=chain_fetcher,
-        sleeper=sleeper,
-    )
-    if options_outcome.failed:
-        logger.warning("option chain fetch failed for %d symbols", len(options_outcome.failed))
+
+        options_outcome = options.fetch_options(
+            [
+                options.OptionQuery(
+                    symbol=symbol,
+                    spot=signals_by_symbol[symbol].spot,
+                    dividend_yield=funds[symbol].dividend_yield,
+                )
+                for symbol in symbols
+            ],
+            today=as_of,
+            r=rate,
+            expiries_fetcher=expiries_fetcher,
+            chain_fetcher=chain_fetcher,
+            sleeper=sleeper,
+        )
+        if options_outcome.failed:
+            logger.warning("option chain fetch failed for %d symbols", len(options_outcome.failed))
 
     iv30_by_symbol = {symbol: result.iv30 for symbol, result in options_outcome.results.items()}
     rv20_by_symbol = {
@@ -492,9 +517,18 @@ def _run_full_scan(
         )
         for symbol in symbols
     ]
+    # matches_count = the Wide preset, the loosest §6 tier — "anything worth a
+    # look". (Rows from scans 1-3 predate M3 and counted trend+zone+turning
+    # instead; the column is not comparable across that boundary.)
     matches = sum(1 for row in rows if row["passes_wide"])
+    # A symbol can fail both fetches; the ceiling counts it once.
+    data_failures = len(set(options_outcome.failed) | set(funds_outcome.failed))
     status, notes = assess(
-        len(selected), len(signals_by_symbol), option_failures=len(options_outcome.failed)
+        len(selected),
+        len(signals_by_symbol),
+        option_failures=len(options_outcome.failed),
+        fundamentals_failures=len(funds_outcome.failed),
+        data_failures=data_failures,
     )
 
     db.write_scan_results(client, rows)
@@ -526,6 +560,7 @@ def _run_full_scan(
         status=status,
         notes=notes,
         option_failures=len(options_outcome.failed),
+        fundamentals_failures=len(funds_outcome.failed),
     )
 
 

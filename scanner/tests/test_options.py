@@ -112,6 +112,31 @@ class TestSelectContract:
             options.bs_delta(100.0, 100.0, contract.dte / 365.0, 0.04, 0.0, 0.30) - 0.70
         )
 
+    def test_crossed_quotes_are_excluded(self):
+        # A stale crossed market (ask below bid) would carry a negative
+        # spread that trivially clears every preset gate.
+        contract = self.select(
+            [
+                (90.0, 5.00, 0.05, 1000, 0.30),  # crossed: nearest to 0.70Δ
+                (100.0, 12.0, 14.0, 1000, 0.30),
+            ]
+        )
+
+        assert contract.strike == 100.0
+        assert contract.spread_pct > 0
+
+    def test_junk_strings_in_chain_cells_are_skipped_not_fatal(self):
+        # One bad cell must cost one contract, never the scan.
+        contract = self.select(
+            [
+                (90.0, "N/A", 19.0, 1000, 0.30),
+                (100.0, 12.0, 14.0, "Infinity", "0.30x"),
+                (110.0, 9.0, 10.0, 800, 0.30),
+            ]
+        )
+
+        assert contract.strike == 110.0
+
     def test_zero_bid_contracts_are_excluded_even_if_closer_to_target(self):
         contract = self.select(
             [
@@ -186,6 +211,30 @@ class TestAtmIv:
         )
 
         assert options.atm_iv(chain, 100.0) is None
+
+    def test_a_side_whose_nearest_usable_strike_is_far_from_spot_is_skipped(self):
+        # Near-the-money put IVs are all NaN; the only usable put sits at half
+        # of spot. Blending that wing quote into "ATM" would import skew.
+        chain = OptionChain(
+            calls=calls_frame([(100.0, 1.0, 2.0, 10, 0.30)]),
+            puts=calls_frame([(50.0, 1.0, 2.0, 10, 0.90), (100.0, 1.0, 2.0, 10, np.nan)]),
+        )
+
+        assert options.atm_iv(chain, 100.0) == pytest.approx(0.30)
+
+    def test_none_sides_from_yfinance_are_treated_as_empty(self):
+        # yfinance returns Options(calls=None, puts=None) when the payload is
+        # missing; the emptiness probe must not raise inside the retry loop.
+        chain = OptionChain(calls=None, puts=None)
+
+        assert chain.is_empty is True
+        assert options.atm_iv(chain, 100.0) is None
+        assert (
+            options.select_contract(
+                None, spot=100.0, expiry=date(2027, 8, 20), today=TODAY, r=0.04, q=0.0
+            )
+            is None
+        )
 
 
 class TestIv30:
@@ -264,7 +313,8 @@ class TestEvaluateSymbolOptions:
 
         assert self.evaluate(broken, lambda s, e: self.full_chain()) is None
 
-    def test_unfetchable_leap_chain_means_failure(self):
+    def test_unfetchable_leap_chain_is_flagged_but_keeps_iv30(self):
+        # Losing the contract must not also stall §6 snapshot accrual.
         def chains(symbol, expiry):
             if expiry == self.LEAP_EXPIRY:
                 raise ConnectionError("yahoo down")
@@ -272,7 +322,10 @@ class TestEvaluateSymbolOptions:
 
         result = self.evaluate(lambda s: [self.LEAP_EXPIRY, self.NEAR_EXPIRY], chains)
 
-        assert result is None
+        assert result is not None
+        assert result.chain_failed is True
+        assert result.contract is None
+        assert result.iv30 == pytest.approx(0.31)  # mean of 0.30 call / 0.32 put
 
     def test_unfetchable_iv30_chains_degrade_to_missing_iv30(self):
         # A 49d expiry keeps the LEAP chain out of the 30d bracket, so both
@@ -315,7 +368,7 @@ class TestEvaluateSymbolOptions:
         result = self.evaluate(lambda s: [self.LEAP_EXPIRY], chains)
 
         # Attempt 1 came back empty and was retried; attempt 2 delivered the
-        # contract; attempt 3 is the same expiry fetched again as the nearest
-        # IV30 term (the only expiry in the list).
+        # chain. The LEAP expiry doubles as the only IV30 term, and the memo
+        # means it is not fetched a third time.
         assert result.contract is not None
-        assert len(attempts) == 3
+        assert len(attempts) == 2

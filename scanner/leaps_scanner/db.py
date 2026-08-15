@@ -115,6 +115,9 @@ def fetch_iv_history(
 
     Paged through explicit ranges because PostgREST caps a single response;
     ordering by (symbol, snap_date) keeps the pages stable while reading.
+    The loop only stops on an empty page and advances by the rows actually
+    received: PostgREST's `max-rows` setting truncates pages *silently* (HTTP
+    200), so "shorter than requested" is not proof the data is exhausted.
     """
     history: dict[str, list[tuple[date, float]]] = {}
     offset = 0
@@ -130,14 +133,14 @@ def fetch_iv_history(
             .execute()
         )
         rows = response.data or []
+        if not rows:
+            return history
         for row in rows:
             if row.get("iv30") is None:
                 continue
             snap_date = date.fromisoformat(row["snap_date"])
             history.setdefault(row["symbol"], []).append((snap_date, float(row["iv30"])))
-        if len(rows) < READ_PAGE_SIZE:
-            return history
-        offset += READ_PAGE_SIZE
+        offset += len(rows)
 
 
 def _chunks(rows: Sequence[dict[str, Any]], size: int = WRITE_CHUNK_SIZE):

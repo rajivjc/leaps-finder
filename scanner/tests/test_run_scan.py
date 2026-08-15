@@ -359,6 +359,20 @@ class TestAssess:
         assert status == db.STATUS_OK
         assert "10 evaluated without option data" in notes
 
+    def test_fundamentals_failures_count_toward_the_ceiling(self):
+        status, notes = run_scan.assess(100, 100, fundamentals_failures=21)
+
+        assert status == db.STATUS_FAILED
+        assert "21 without fundamentals" in notes
+
+    def test_deduplicated_data_failures_override_the_sum(self):
+        # A symbol that failed both fetches is one incomplete symbol, not two.
+        status, _ = run_scan.assess(
+            100, 100, option_failures=15, fundamentals_failures=15, data_failures=15
+        )
+
+        assert status == db.STATUS_OK
+
     def test_empty_universe_fails(self):
         status, notes = run_scan.assess(0, 0)
 
@@ -496,6 +510,30 @@ class TestRunFullScan:
         assert rows["AAA"]["iv_rank"] == pytest.approx(100.0 * (iv30 - 0.20) / 0.20)
         assert rows["BBB"]["iv_rank_status"] == scoring.IV_RANK_STATUS_WARMING
 
+    def test_rich_history_without_a_current_iv30_is_not_stamped_ok(self):
+        # §6 defines the rank over the *current* iv30. When this scan produced
+        # none, last week's rank must not be asserted as an 'ok' IV fact.
+        client = FakeClient()
+        client.select_rows["iv_snapshots"] = [
+            {
+                "symbol": "AAA",
+                "snap_date": (AS_OF - timedelta(days=200 - i)).isoformat(),
+                "iv30": 0.20 + 0.20 * i / 129,
+            }
+            for i in range(130)
+        ]
+
+        def no_expiries(symbol):
+            raise ConnectionError("yahoo down")
+
+        self.run(client, expiries_fetcher=no_expiries)
+
+        rows = {row["symbol"]: row for row in client.rows("scan_results", "upsert")[0]}
+        assert rows["AAA"]["iv_rank_status"] == scoring.IV_RANK_STATUS_WARMING
+        assert rows["AAA"]["iv_rank"] is None
+        assert rows["AAA"]["iv_pass"] is False
+        assert rows["AAA"]["s_option"] is None
+
     def test_losing_most_of_the_universe_fails_the_scan(self):
         client = FakeClient()
 
@@ -523,6 +561,37 @@ class TestRunFullScan:
         rows = client.rows("scan_results", "upsert")[0]
         assert all(row["opt_strike"] is None for row in rows)
 
+    def test_a_failed_leap_chain_still_accrues_the_iv_snapshot(self):
+        # Losing the contract must not also stall the 120-snapshot warm-up.
+        client = FakeClient()
+
+        def leap_less_chains(symbol, expiry):
+            if expiry == LEAP_EXPIRY:
+                raise ConnectionError("yahoo down")
+            return fake_chain(symbol, expiry)
+
+        report = self.run(client, chain_fetcher=leap_less_chains)
+
+        assert report.option_failures == 2
+        snapshot_rows = client.rows("iv_snapshots", "upsert")[0]
+        assert all(row["iv30"] is not None for row in snapshot_rows)
+
+    def test_losing_every_fundamentals_payload_fails_the_scan(self):
+        # A wholesale info-endpoint outage is partial data, not a universe of
+        # companies without financials.
+        client = FakeClient()
+
+        def no_fundamentals(symbol):
+            raise ConnectionError("yahoo down")
+
+        report = self.run(client, fundamentals_fetcher=no_fundamentals)
+
+        assert report.status == db.STATUS_FAILED
+        assert report.fundamentals_failures == 2
+        # Rows are still written, with the quality columns honestly null.
+        rows = client.rows("scan_results", "upsert")[0]
+        assert all(row["s_quality"] is None for row in rows)
+
     def test_unavailable_risk_free_rate_aborts_the_scan_as_failed(self):
         client = FakeClient()
 
@@ -548,6 +617,27 @@ class TestRunFullScan:
         assert report.status == db.STATUS_FAILED
         # Nothing to write means no request at all, not an empty one.
         assert client.rows("scan_results", "upsert") == []
+
+
+class TestFetchIvHistory:
+    def test_reads_past_the_page_size_until_an_empty_page(self):
+        # PostgREST's max-rows truncates pages silently, so a short page is
+        # not proof of exhaustion — only an empty one is.
+        client = FakeClient()
+        client.select_rows["iv_snapshots"] = [
+            {
+                "symbol": "AAA",
+                "snap_date": (AS_OF - timedelta(days=1400 - i)).isoformat(),
+                "iv30": 0.20,
+            }
+            for i in range(1250)
+        ]
+
+        history = db.fetch_iv_history(client, since=AS_OF - timedelta(days=2000), until=AS_OF)
+
+        assert len(history["AAA"]) == 1250
+        selects = [payload for name, verb, payload in client.calls if verb == "select"]
+        assert len(selects) == 3  # 1000 + 250 + the confirming empty page
 
 
 # --------------------------------------------------------------------------

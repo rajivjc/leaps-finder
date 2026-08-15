@@ -82,25 +82,29 @@ class TestFetchFundamentals:
         def fetcher(symbol):
             return from_info(FULL_INFO)
 
-        results = fundamentals.fetch_fundamentals(
+        outcome = fundamentals.fetch_fundamentals(
             ["AAA", "BBB"], fetcher=fetcher, sleeper=lambda _: None
         )
 
-        assert sorted(results) == ["AAA", "BBB"]
-        assert results["AAA"].op_margin == pytest.approx(0.25)
+        assert sorted(outcome.results) == ["AAA", "BBB"]
+        assert outcome.results["AAA"].op_margin == pytest.approx(0.25)
+        assert outcome.failed == ()
 
-    def test_a_symbol_that_keeps_failing_gets_an_empty_snapshot(self):
+    def test_a_symbol_that_keeps_failing_gets_an_empty_snapshot_and_is_reported(self):
+        # The empty snapshot keeps the pipeline indexable; the failed tuple is
+        # what stops a wholesale outage from looking like missing financials.
         def fetcher(symbol):
             if symbol == "BBB":
                 raise ConnectionError("yahoo down")
             return from_info(FULL_INFO)
 
-        results = fundamentals.fetch_fundamentals(
+        outcome = fundamentals.fetch_fundamentals(
             ["AAA", "BBB"], fetcher=fetcher, sleeper=lambda _: None
         )
 
-        assert results["BBB"] == Fundamentals()
-        assert results["AAA"].is_empty is False
+        assert outcome.results["BBB"] == Fundamentals()
+        assert outcome.results["AAA"].is_empty is False
+        assert outcome.failed == ("BBB",)
 
     def test_empty_payloads_are_retried_like_errors(self):
         attempts = []
@@ -111,7 +115,7 @@ class TestFetchFundamentals:
                 return Fundamentals()  # yfinance-style silent failure
             return from_info(FULL_INFO)
 
-        results = fundamentals.fetch_fundamentals(
+        outcome = fundamentals.fetch_fundamentals(
             ["AAA"],
             fetcher=fetcher,
             throttle=Throttle(sleeper=lambda _: None),
@@ -119,4 +123,5 @@ class TestFetchFundamentals:
         )
 
         assert len(attempts) == 2
-        assert results["AAA"].is_empty is False
+        assert outcome.results["AAA"].is_empty is False
+        assert outcome.failed == ()

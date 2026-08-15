@@ -180,10 +180,13 @@ class TestOptionScore:
 
         assert scoring.option_score(econ, 0.275, 25.0) == pytest.approx(50.0)
 
-    def test_missing_iv_inputs_are_excluded_from_the_mean(self):
+    def test_missing_iv_inputs_null_the_subscore(self):
+        # Unknown IV averaged over three terms would outscore known-expensive
+        # IV averaged over five; §6's mean-of-five needs all five.
         econ = contract(cost_pct_spot=0.225, spread_pct=0.06, oi=1050)
 
-        assert scoring.option_score(econ, None, None) == pytest.approx(50.0)
+        assert scoring.option_score(econ, None, 25.0) is None
+        assert scoring.option_score(econ, 0.275, None) is None
 
 
 class TestValuationScore:

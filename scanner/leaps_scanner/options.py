@@ -20,6 +20,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date
+from functools import cache
 
 import numpy as np
 import pandas as pd
@@ -36,10 +37,21 @@ RV_WINDOW = 20
 TRADING_DAYS_PER_YEAR = 252
 DAYS_PER_YEAR = 365.0
 
+# Data-sanity bound for the ATM lookup: a strike this far from spot is not
+# "at the money" no matter what the rest of the chain looks like, so a side
+# whose nearest usable strike is outside the band contributes no reading.
+ATM_MAX_DISTANCE = 0.20
+
 RISK_FREE_SYMBOL = "^IRX"
 
 ExpiriesFetcher = Callable[[str], Sequence[date]]
 ChainFetcher = Callable[[str, date], "OptionChain"]
+
+
+def _frame_or_empty(frame) -> pd.DataFrame:
+    """yfinance returns None (not an empty frame) for a chain side with no
+    payload at all; normalize so downstream code never sees None."""
+    return frame if frame is not None else pd.DataFrame()
 
 
 @dataclass(frozen=True)
@@ -51,7 +63,10 @@ class OptionChain:
 
     @property
     def is_empty(self) -> bool:
-        return self.calls.empty and self.puts.empty
+        # None-safe on both sides: this property is the emptiness probe inside
+        # the retry loop, where an AttributeError would abort the whole scan.
+        calls, puts = _frame_or_empty(self.calls), _frame_or_empty(self.puts)
+        return calls.empty and puts.empty
 
 
 @dataclass(frozen=True)
@@ -87,13 +102,16 @@ class OptionsResult:
     """Everything the options step produced for one symbol.
 
     `contract` is None when the chain was fetched but no call passed the
-    bid/ask filter — a market fact, recorded as nulls. A symbol whose chain
-    could not be fetched at all never gets a result (it counts against the
-    scan's coverage instead).
+    quote filters — a market fact, recorded as nulls. `chain_failed` marks a
+    LEAP chain that could not be fetched at all: the symbol counts against
+    scan coverage, but whatever IV30 the near-dated chains yielded is kept so
+    the §6 snapshot history keeps accruing. A symbol whose expiries list never
+    arrived gets no result at all.
     """
 
     contract: ContractEconomics | None
     iv30: float | None
+    chain_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -148,9 +166,17 @@ def select_leap_expiry(expiries: Sequence[date], today: date) -> ExpiryChoice | 
 
 
 def _finite(value) -> float | None:
+    """Coerce an untrusted Yahoo cell to a finite float, or None.
+
+    Junk (strings, None, NaN, infinities) degrades to None rather than
+    raising — one bad cell must cost one contract, never the scan.
+    """
     if value is None:
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -171,6 +197,7 @@ def select_contract(
     """
     dte = (expiry - today).days
     t_years = dte / DAYS_PER_YEAR
+    calls = _frame_or_empty(calls)
     if t_years <= 0 or calls.empty:
         return None
 
@@ -185,6 +212,10 @@ def select_contract(
         if strike is None or strike <= 0:
             continue
         if bid is None or ask is None or bid <= 0 or ask <= 0:
+            continue
+        # A crossed market (ask below bid) is a stale or broken quote; its
+        # negative spread would trivially clear every preset gate.
+        if ask < bid:
             continue
         if sigma is None or sigma <= 0:
             continue
@@ -218,9 +249,15 @@ def select_contract(
 
 def atm_iv(chain: OptionChain, spot: float) -> float | None:
     """ATM IV for one expiry: mean of call and put IV at the strike nearest
-    spot (§3.5). One usable side is accepted; none means no reading."""
+    spot (§3.5). One usable side is accepted; none means no reading.
+
+    A side whose nearest usable strike sits outside ATM_MAX_DISTANCE of spot
+    is skipped — blending a deep-OTM wing quote into an "ATM" reading would
+    import skew, not vol level.
+    """
     readings = []
     for side in (chain.calls, chain.puts):
+        side = _frame_or_empty(side)
         if side.empty or "strike" not in side or "impliedVolatility" not in side:
             continue
         usable = side[
@@ -231,6 +268,8 @@ def atm_iv(chain: OptionChain, spot: float) -> float | None:
         if usable.empty:
             continue
         nearest = usable.loc[(usable["strike"] - spot).abs().idxmin()]
+        if abs(float(nearest["strike"]) / spot - 1.0) > ATM_MAX_DISTANCE:
+            continue
         readings.append(float(nearest["impliedVolatility"]))
 
     return sum(readings) / len(readings) if readings else None
@@ -293,22 +332,26 @@ def evaluate_symbol_options(
     sleeper: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
 ) -> OptionsResult | None:
-    """§3.4-5 for one symbol. None means the fetch itself failed.
+    """§3.4-5 for one symbol. None means the expiries list never arrived.
 
-    The LEAP chain is load-bearing: if it cannot be fetched, the symbol has no
-    options result at all and counts against scan coverage. The 30-day chains
-    only feed IV30, so their failure degrades to iv30=None instead.
+    The 30-day chains are fetched first and their IV30 survives a failed LEAP
+    fetch (`chain_failed=True`): losing the contract must not also stall the
+    symbol's §6 snapshot accrual. Chains are memoized per expiry — the LEAP
+    expiry can double as the nearest IV30 term on sparse chains.
     """
+    chains: dict[date, OptionChain | None] = {}
 
     def fetch_chain(expiry: date) -> OptionChain | None:
-        return retry_fetch(
-            lambda: chain_fetcher(query.symbol, expiry),
-            describe=f"option chain {query.symbol} {expiry}",
-            throttle=throttle,
-            sleeper=sleeper,
-            rng=rng,
-            is_empty=lambda chain: chain.is_empty,
-        )
+        if expiry not in chains:
+            chains[expiry] = retry_fetch(
+                lambda: chain_fetcher(query.symbol, expiry),
+                describe=f"option chain {query.symbol} {expiry}",
+                throttle=throttle,
+                sleeper=sleeper,
+                rng=rng,
+                is_empty=lambda chain: chain.is_empty,
+            )
+        return chains[expiry]
 
     expiries = retry_fetch(
         lambda: list(expiries_fetcher(query.symbol)),
@@ -321,12 +364,22 @@ def evaluate_symbol_options(
     if expiries is None:
         return None
 
+    terms = []
+    for expiry in iv30_expiries(expiries, today):
+        chain = fetch_chain(expiry)
+        if chain is None:
+            continue
+        reading = atm_iv(chain, query.spot)
+        if reading is not None:
+            terms.append(((expiry - today).days, reading))
+    iv30 = interpolate_iv30(terms)
+
     contract = None
     choice = select_leap_expiry(expiries, today)
     if choice is not None:
         chain = fetch_chain(choice.expiry)
         if chain is None:
-            return None
+            return OptionsResult(contract=None, iv30=iv30, chain_failed=True)
         contract = select_contract(
             chain.calls,
             spot=query.spot,
@@ -336,16 +389,7 @@ def evaluate_symbol_options(
             q=query.dividend_yield,
         )
 
-    terms = []
-    for expiry in iv30_expiries(expiries, today):
-        chain = fetch_chain(expiry)
-        if chain is None:
-            continue
-        reading = atm_iv(chain, query.spot)
-        if reading is not None:
-            terms.append(((expiry - today).days, reading))
-
-    return OptionsResult(contract=contract, iv30=interpolate_iv30(terms))
+    return OptionsResult(contract=contract, iv30=iv30)
 
 
 def fetch_options(
@@ -375,35 +419,51 @@ def fetch_options(
             sleeper=sleeper,
             rng=rng,
         )
-        if result is None:
+        if result is None or result.chain_failed:
             failed.append(query.symbol)
-        else:
+        if result is not None:
             results[query.symbol] = result
 
     return OptionsOutcome(results=results, failed=tuple(failed))
 
 
-def yahoo_expiries(symbol: str) -> list[date]:
-    """Default expiries fetcher: yfinance's listed option expiration dates."""
+@cache
+def _yahoo_ticker(symbol: str):
+    """One Ticker per symbol for the whole run.
+
+    A fresh Ticker calling `option_chain(date)` first downloads the default
+    chain just to learn the expiration map — a hidden second HTTP request per
+    throttled fetch. Reusing the instance whose `.options` call already
+    populated that map keeps each chain fetch to a single request, and pins
+    the expiry list the pipeline chose from to the map the chain fetch
+    validates against (no mid-run drift `ValueError`s).
+    """
     import yfinance as yf
 
-    ticker = yf.Ticker(symbol, session=shared_session())
-    return [date.fromisoformat(text) for text in ticker.options]
+    return yf.Ticker(symbol, session=shared_session())
+
+
+def yahoo_expiries(symbol: str) -> list[date]:
+    """Default expiries fetcher: yfinance's listed option expiration dates."""
+    return [date.fromisoformat(text) for text in _yahoo_ticker(symbol).options]
 
 
 def yahoo_chain(symbol: str, expiry: date) -> OptionChain:
     """Default chain fetcher: one expiry's calls and puts."""
-    import yfinance as yf
-
-    ticker = yf.Ticker(symbol, session=shared_session())
-    chain = ticker.option_chain(expiry.isoformat())
-    return OptionChain(calls=chain.calls, puts=chain.puts)
+    chain = _yahoo_ticker(symbol).option_chain(expiry.isoformat())
+    # yfinance returns None sides (not empty frames) when the payload is
+    # absent; normalize at the boundary so nothing downstream sees None.
+    return OptionChain(calls=_frame_or_empty(chain.calls), puts=_frame_or_empty(chain.puts))
 
 
 def yahoo_risk_free_rate() -> float | None:
-    """§5.2's r: the 13-week T-bill yield. ^IRX quotes the rate ×100."""
+    """§5.2's r: the 13-week T-bill yield. ^IRX quotes the rate ×100.
+
+    Zero is a valid rate (bills printed 0.00 through 2020-21); only a missing
+    quote is None.
+    """
     import yfinance as yf
 
     ticker = yf.Ticker(RISK_FREE_SYMBOL, session=shared_session())
     value = ticker.fast_info["lastPrice"]
-    return float(value) / 100.0 if value else None
+    return float(value) / 100.0 if value is not None else None

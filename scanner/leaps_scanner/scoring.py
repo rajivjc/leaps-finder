@@ -14,10 +14,11 @@ gap, the decision is recorded here rather than improvised silently:
 * The standalone checklist booleans `quality_pass` / `iv_pass` use the
   Balanced thresholds (≥ 45, ≤ 50) and `valuation_pass` means positive
   haircut-adjusted upside; the spec's preset table never defines them.
-* A missing metric is excluded from its subscore's mean (§6 says so for
-  Quality; the same convention is applied to Option economics and Valuation).
-  A composite with any missing subscore is null — reweighting the remainder
-  would quietly inflate the visible number.
+* A missing metric is excluded from its subscore's mean for Quality (§6 says
+  so) and Valuation (the same convention). Option economics instead requires
+  all five terms — dropping an unknown IV term would let unknown vol outscore
+  known-expensive vol. A composite with any missing subscore is null —
+  reweighting the remainder would quietly inflate the visible number.
 """
 
 from __future__ import annotations
@@ -118,20 +119,26 @@ def option_score(
     iv30: float | None,
     iv_rank_value: float | None,
 ) -> float | None:
-    """§6 Option economics. `iv_rank_value` is the real IV rank or, while
-    warming up, the substituted iv30/rv20 percentile. No contract, no score."""
-    if contract is None:
+    """§6 Option economics: the mean of all five pinned terms, or nothing.
+
+    `iv_rank_value` is the real IV rank or, while warming up, the substituted
+    iv30/rv20 percentile. Unlike Quality, a missing term here is not excluded
+    from the mean: unknown IV averaging over three terms would outscore
+    known-expensive IV averaged over five, so a symbol without a contract or
+    without IV data has no option subscore at all (and thus no composite).
+    """
+    if contract is None or iv30 is None or iv_rank_value is None:
         return None
 
-    parts = []
-    if iv_rank_value is not None:
-        parts.append(clip_map(50.0 - iv_rank_value, 0.0, 50.0))
-    if iv30 is not None:
-        parts.append(clip_map(0.40 - iv30, 0.0, 0.25))
-    parts.append(clip_map(0.30 - contract.cost_pct_spot, 0.0, 0.15))
-    parts.append(clip_map(0.10 - contract.spread_pct, 0.0, 0.08))
-    parts.append(clip_map(contract.oi, 100.0, 2000.0))
-    return fmean(parts)
+    return fmean(
+        [
+            clip_map(50.0 - iv_rank_value, 0.0, 50.0),
+            clip_map(0.40 - iv30, 0.0, 0.25),
+            clip_map(0.30 - contract.cost_pct_spot, 0.0, 0.15),
+            clip_map(0.10 - contract.spread_pct, 0.0, 0.08),
+            clip_map(contract.oi, 100.0, 2000.0),
+        ]
+    )
 
 
 def upside_adjusted(analyst_target: float | None, spot: float) -> float | None:
