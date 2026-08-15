@@ -14,6 +14,7 @@ import {
   CandlestickSeries,
   ColorType,
   CrosshairMode,
+  type IChartApi,
   LineSeries,
   LineStyle,
   createChart,
@@ -36,8 +37,50 @@ export const CHART_BASE_OPTIONS = {
   rightPriceScale: { borderColor: "#e5e7eb" },
   timeScale: { borderColor: "#e5e7eb" },
   crosshair: { mode: CrosshairMode.Normal },
-  autoSize: true,
 } as const;
+
+/**
+ * Create a chart sized to its container, and keep it that way.
+ *
+ * Deliberately *not* `autoSize: true`. That option measures the container
+ * through a ResizeObserver, which fires asynchronously — so a `fitContent()`
+ * called right after `createChart` computes its bar spacing against a chart
+ * that still believes it has no width, and every bar ends up crushed against
+ * the right edge at the minimum spacing. Passing the width in at construction
+ * makes the first fit correct, and the observer keeps it correct afterwards.
+ *
+ * Callers add their series and then call the returned `fit`.
+ */
+export function createSizedChart(
+  element: HTMLDivElement,
+  options: Parameters<typeof createChart>[1] = {},
+): { chart: IChartApi; fit: () => void; dispose: () => void } {
+  const chart = createChart(element, {
+    ...CHART_BASE_OPTIONS,
+    ...options,
+    width: element.clientWidth,
+    height: element.clientHeight,
+  });
+
+  const fit = () => chart.timeScale().fitContent();
+
+  const observer = new ResizeObserver(() => {
+    if (element.clientWidth === 0) return;
+    chart.applyOptions({ width: element.clientWidth, height: element.clientHeight });
+    // Re-fit rather than preserving the zoom: these panels show one fixed
+    // window (a year of weeks), so "all of it, filling the width" is the only
+    // view that makes sense at any size.
+    fit();
+  });
+  observer.observe(element);
+
+  const dispose = () => {
+    observer.disconnect();
+    chart.remove();
+  };
+
+  return { chart, fit, dispose };
+}
 
 type Candle = { time: string; open: number; high: number; low: number; close: number };
 
@@ -70,7 +113,7 @@ export function PriceChart({ bars, symbol }: { bars: WeeklyBar[]; symbol: string
     const element = container.current;
     if (!element || bars.length === 0) return;
 
-    const chart = createChart(element, CHART_BASE_OPTIONS);
+    const { chart, fit, dispose } = createSizedChart(element);
 
     const candles = chart.addSeries(CandlestickSeries, {
       upColor: "#3f7d63",
@@ -101,8 +144,8 @@ export function PriceChart({ bars, symbol }: { bars: WeeklyBar[]; symbol: string
     });
     sma200.setData(toLine(bars, "sma200"));
 
-    chart.timeScale().fitContent();
-    return () => chart.remove();
+    fit();
+    return dispose;
   }, [bars]);
 
   if (bars.length === 0) {

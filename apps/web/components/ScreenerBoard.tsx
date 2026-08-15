@@ -99,10 +99,6 @@ export function ScreenerBoard({
   tickers: Record<string, Ticker>;
   sparklines: Record<string, number[]>;
 }) {
-  const [preset, setPreset] = useState<Preset>("balanced");
-  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-
   const counts = useMemo(
     () =>
       Object.fromEntries(
@@ -110,6 +106,18 @@ export function ScreenerBoard({
       ) as Record<Preset, number>,
     [rows],
   );
+
+  // Open on the strictest tier that actually has candidates, falling back to
+  // Wide when nothing clears anything. This hides nothing: every tab carries
+  // its own count, so a week where Strict and Balanced are both empty says so
+  // on the tabs themselves — it just avoids opening on a blank list when
+  // stricter tiers are routinely empty (LEAPS open interest is the usual
+  // binding gate).
+  const [preset, setPreset] = useState<Preset>(
+    () => PRESETS.find((entry) => counts[entry.key] > 0)?.key ?? "wide",
+  );
+  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS);
+  const [drawerOpen, setDrawerOpen] = useState(false);
 
   const sectors = useMemo(
     () =>

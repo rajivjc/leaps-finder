@@ -12,10 +12,10 @@
  * numbers the row was scored from, not a second implementation of the formula.
  */
 
-import { LineSeries, LineStyle, createChart } from "lightweight-charts";
+import { LineSeries, LineStyle } from "lightweight-charts";
 import { useEffect, useMemo, useRef } from "react";
 
-import { CHART_BASE_OPTIONS, ChartEmpty, Legend } from "@/components/PriceChart";
+import { ChartEmpty, Legend, createSizedChart } from "@/components/PriceChart";
 import type { WeeklyBar } from "@/lib/types";
 
 const ZONE_LOW = 20;
@@ -31,7 +31,7 @@ export function StochasticPanel({ bars }: { bars: WeeklyBar[] }) {
     const element = container.current;
     if (!element || usable.length === 0) return;
 
-    const chart = createChart(element, CHART_BASE_OPTIONS);
+    const { chart, fit, dispose } = createSizedChart(element);
 
     const slowK = chart.addSeries(LineSeries, {
       color: "#111827",
@@ -72,8 +72,8 @@ export function StochasticPanel({ bars }: { bars: WeeklyBar[] }) {
       });
     }
 
-    chart.timeScale().fitContent();
-    return () => chart.remove();
+    fit();
+    return dispose;
   }, [bars, usable]);
 
   if (usable.length === 0) {
