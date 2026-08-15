@@ -21,11 +21,11 @@ GitHub Actions (cron)          Supabase Postgres            Vercel
 │ scanner (Python)   │ service │ tickers          │  anon   │ Next.js App      │
 │  universe          │  key    │ scans            │  key    │  / screener      │
 │  prices/indicators ├────────▶│ scan_results     │◀────────┤  /t/[symbol]     │
-│  fundamentals      │  write  │ iv_snapshots     │  read   │  /compare        │
-│  options + BS delta│         │ positions (RLS)  │         │  /positions      │
-│  scoring           │         │ alerts    (RLS)  │         │  /about          │
-│  exit monitor      │         └──────────────────┘         └──────────────────┘
-└────────────────────┘
+│  fundamentals      │  write  │ weekly_bars      │  read   │  /compare        │
+│  options + BS delta│         │ iv_snapshots     │         │  /positions      │
+│  scoring           │         │ positions (RLS)  │         │  /about          │
+│  exit monitor      │         │ alerts    (RLS)  │         └──────────────────┘
+└────────────────────┘         └──────────────────┘
    weekly: full scan (Sat)                                  server components,
    daily:  refresh + exits                                  precomputed rows only
 ```
@@ -91,8 +91,8 @@ Built milestone by milestone against [SPEC.md §11](SPEC.md).
 
 - [x] **M1 Scaffold** — monorepo, migrations + RLS, Next.js shell with Supabase client, CI
 - [x] **M2 Scanner core** — universe, prices, indicators, `scan_results` writes, weekly cron
-- [ ] **M3 Options + scoring** — chain selection, Black-Scholes delta, IV snapshots, presets
-- [ ] **M4 Frontend** — screener, ticker detail, compare
+- [x] **M3 Options + scoring** — chain selection, Black-Scholes delta, IV snapshots, presets
+- [x] **M4 Frontend** — screener, ticker detail, compare, about; `weekly_bars` chart series
 - [ ] **M5 Risk** — auth, positions, size calculator, exit monitor and alerts
 - [ ] **M6 Polish** — deploy, screenshots, badges
 

@@ -37,7 +37,7 @@ jobs:
         run: pytest
 
   web:
-    name: Web (eslint + tsc + build)
+    name: Web (eslint + tsc + vitest + build)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -63,6 +63,11 @@ jobs:
         run: |
           npx next typegen
           npx tsc --noEmit
+
+      # The spec formulas that live in TypeScript rather than in the scanner:
+      # §5.5's cushion, §7's position sizing, and the null display semantics.
+      - name: Test
+        run: npm test
 
       # Builds without Supabase env vars on purpose: the app must degrade to an
       # unconfigured state rather than fail the build.

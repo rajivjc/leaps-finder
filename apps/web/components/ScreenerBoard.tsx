@@ -119,13 +119,17 @@ export function ScreenerBoard({
 
   const { visible, unknownCount } = useMemo(() => {
     const field = PRESETS.find((entry) => entry.key === preset)!.field;
+
+    // The drawer takes billions and percents; the columns hold raw dollars and
+    // fractions, so the bounds are converted once here rather than per row.
+    const capBillions = parse(filters.marketCapMinB);
+    const spreadPercent = parse(filters.spreadMaxPct);
     const bounds = {
       stochMin: parse(filters.stochMin),
       stochMax: parse(filters.stochMax),
       ivRankMax: parse(filters.ivRankMax),
-      // Entered in billions and percent, stored as raw dollars and fractions.
-      marketCapMin: parse(filters.marketCapMinB) === null ? null : parse(filters.marketCapMinB)! * 1e9,
-      spreadMax: parse(filters.spreadMaxPct) === null ? null : parse(filters.spreadMaxPct)! / 100,
+      marketCapMin: capBillions === null ? null : capBillions * 1e9,
+      spreadMax: spreadPercent === null ? null : spreadPercent / 100,
       oiMin: parse(filters.oiMin),
       earningsMin: parse(filters.earningsMinDays),
     };
@@ -220,7 +224,7 @@ export function ScreenerBoard({
           <Field label="Spread ≤ (%)" value={filters.spreadMaxPct} onChange={(v) => setFilters({ ...filters, spreadMaxPct: v })} />
           <Field label="Open interest ≥" value={filters.oiMin} onChange={(v) => setFilters({ ...filters, oiMin: v })} />
           <Field label="Earnings ≥ (days)" value={filters.earningsMinDays} onChange={(v) => setFilters({ ...filters, earningsMinDays: v })} />
-          <label className="space-y-1 text-xs">
+          <label className="block space-y-1 text-xs">
             <span className="text-[var(--muted)]">Sector</span>
             <select
               value={filters.sector}
@@ -290,7 +294,7 @@ function Field({
   onChange: (value: string) => void;
 }) {
   return (
-    <label className="space-y-1 text-xs">
+    <label className="block space-y-1 text-xs">
       <span className="text-[var(--muted)]">{label}</span>
       <input
         type="number"

@@ -64,7 +64,11 @@ export function fmtCompactUsd(value: number | null | undefined): string {
   ];
   for (const [scale, suffix] of units) {
     if (Math.abs(value) >= scale) {
-      return `$${(value / scale).toFixed(value / scale >= 100 ? 0 : 2)}${suffix}`;
+      // Roughly three significant figures: $1.42T, $318B, $50.4B — enough to
+      // compare caps without implying the underlying number is that precise.
+      const scaled = value / scale;
+      const digits = Math.abs(scaled) >= 100 ? 0 : Math.abs(scaled) >= 10 ? 1 : 2;
+      return `$${scaled.toFixed(digits)}${suffix}`;
     }
   }
   return fmtUsd(value, 0);
