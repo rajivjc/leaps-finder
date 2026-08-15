@@ -233,3 +233,50 @@ class TestEvaluate:
     def test_empty_history_is_rejected(self):
         with pytest.raises(InsufficientHistory):
             indicators.evaluate(daily_frame(0))
+
+
+class TestWeeksSinceCrossUp:
+    def test_cross_on_the_latest_bar_is_one(self):
+        slow_k = pd.Series([10.0, 15.0, 25.0])
+        d = pd.Series([12.0, 16.0, 20.0])
+
+        assert indicators.weeks_since_cross_up(slow_k, d) == 1
+
+    def test_cross_two_bars_ago_is_two(self):
+        slow_k = pd.Series([10.0, 25.0, 30.0])
+        d = pd.Series([12.0, 20.0, 24.0])
+
+        assert indicators.weeks_since_cross_up(slow_k, d) == 2
+
+    def test_no_cross_in_history_is_none(self):
+        always_below = pd.Series([10.0, 12.0, 14.0])
+        d = pd.Series([20.0, 22.0, 24.0])
+
+        assert indicators.weeks_since_cross_up(always_below, d) is None
+
+    def test_touching_from_below_then_rising_counts_as_a_cross(self):
+        # Equality is "at or below": leaving it upward is the transition.
+        slow_k = pd.Series([20.0, 25.0])
+        d = pd.Series([20.0, 22.0])
+
+        assert indicators.weeks_since_cross_up(slow_k, d) == 1
+
+    def test_an_older_cross_is_still_found_behind_a_recent_dip(self):
+        slow_k = pd.Series([10.0, 25.0, 30.0, 28.0])
+        d = pd.Series([12.0, 20.0, 24.0, 29.0])
+
+        assert indicators.weeks_since_cross_up(slow_k, d) == 3
+
+
+class TestScoringInputs:
+    def test_share_above_sma50_is_a_fraction_of_the_last_60_sessions(self):
+        signals = indicators.evaluate(daily_frame(500))
+
+        # A monotonic rise closes above its SMA50 every session.
+        assert signals.share_above_sma50_60d == pytest.approx(1.0)
+
+    def test_downtrend_share_is_zero(self):
+        closes = np.linspace(200.0, 100.0, 500)
+        signals = indicators.evaluate(daily_frame(500, closes=closes))
+
+        assert signals.share_above_sma50_60d == pytest.approx(0.0)

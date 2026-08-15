@@ -31,6 +31,9 @@ SMA_FAST = 50
 SMA_SLOW = 200
 SESSIONS_52W = 252
 
+# SPEC.md §6 Trend: share of the last 60 sessions closing above the SMA50.
+SHARE_SESSIONS = 60
+
 # Bars needed before the last stochastic value is fully defined: the %K window,
 # then two more for each 3-period average.
 MIN_WEEKLY_BARS = STOCH_K_PERIOD + (STOCH_K_SMOOTH - 1) + (STOCH_D_SMOOTH - 1)
@@ -59,6 +62,11 @@ class Signals:
     turning_up: bool
     pct_off_52w_high: float
     avg_volume_30d: float
+    # §6 scoring inputs: fraction of the last 60 sessions closing above their
+    # own SMA50, and how many completed weeks ago slowK last crossed above D
+    # (1 = on the latest bar; None = never in the available history).
+    share_above_sma50_60d: float
+    weeks_since_cross_up: int | None
 
 
 def sma(series: pd.Series, window: int) -> pd.Series:
@@ -148,6 +156,21 @@ def crosses_below(series: pd.Series, level: float) -> bool:
     return previous >= level and current < level
 
 
+def weeks_since_cross_up(slow_k: pd.Series, d: pd.Series) -> int | None:
+    """Completed weeks since slowK last crossed above D (SPEC.md §6 Entry).
+
+    A cross on bar t means slowK ≤ D on t−1 and slowK > D on t. Returns 1 when
+    the cross happened on the latest bar, 2 for the bar before, and so on;
+    None when no cross exists in the overlapping history.
+    """
+    diff = (slow_k - d).dropna()
+    values = diff.to_numpy()
+    for back in range(1, len(values)):
+        if values[-back] > 0 and values[-back - 1] <= 0:
+            return back
+    return None
+
+
 def crosses_above(series: pd.Series, level: float) -> bool:
     """Mirror of `crosses_below`: at-or-below previously, above now."""
     clean = series.dropna()
@@ -183,7 +206,8 @@ def evaluate(daily: pd.DataFrame, today: date | None = None) -> Signals:
 
     close = through_week["Close"]
     spot = float(close.iloc[-1])
-    sma50 = float(sma(close, SMA_FAST).iloc[-1])
+    sma50_series = sma(close, SMA_FAST)
+    sma50 = float(sma50_series.iloc[-1])
     sma200 = float(sma(close, SMA_SLOW).iloc[-1])
 
     stoch = slow_stochastic(weekly)
@@ -197,6 +221,9 @@ def evaluate(daily: pd.DataFrame, today: date | None = None) -> Signals:
 
     high_52w = float(through_week["High"].tail(SESSIONS_52W).max())
     avg_volume_30d = float(through_week["Volume"].tail(30).mean())
+    # Each session's close against that session's own SMA50. MIN_DAILY_BARS
+    # (200) guarantees the SMA is defined across the whole 60-session tail.
+    share_above = float((close > sma50_series).tail(SHARE_SESSIONS).mean())
 
     return Signals(
         as_of_date=as_of.date(),
@@ -213,4 +240,6 @@ def evaluate(daily: pd.DataFrame, today: date | None = None) -> Signals:
         # Zero at the high, negative below it.
         pct_off_52w_high=spot / high_52w - 1.0,
         avg_volume_30d=avg_volume_30d,
+        share_above_sma50_60d=share_above,
+        weeks_since_cross_up=weeks_since_cross_up(slow_k, stoch["d"]),
     )

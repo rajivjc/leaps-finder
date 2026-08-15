@@ -243,3 +243,68 @@ class TestFetchDailyOhlcv:
 
     def test_failure_rate_is_zero_when_nothing_was_requested(self):
         assert prices.FetchOutcome(frames={}, failed=()).failure_rate == 0.0
+
+
+class TestRetryFetch:
+    def throttle(self):
+        return Throttle(rate=1e9, sleeper=lambda _: None, clock=lambda: 0.0)
+
+    def test_returns_the_first_usable_result(self):
+        result = prices.retry_fetch(
+            lambda: {"ok": True},
+            describe="thing",
+            throttle=self.throttle(),
+            sleeper=lambda _: None,
+        )
+
+        assert result == {"ok": True}
+
+    def test_empty_results_are_retried_like_errors(self):
+        attempts = []
+
+        def fetch():
+            attempts.append(1)
+            return [] if len(attempts) == 1 else ["row"]
+
+        result = prices.retry_fetch(
+            fetch,
+            describe="thing",
+            throttle=self.throttle(),
+            sleeper=lambda _: None,
+            is_empty=lambda listed: len(listed) == 0,
+        )
+
+        assert result == ["row"]
+        assert len(attempts) == 2
+
+    def test_a_raising_emptiness_probe_is_retried_not_fatal(self):
+        # A malformed result that makes the probe itself raise must count as
+        # a failed attempt, never escape and abort the caller's whole run.
+        attempts = []
+
+        def fetch():
+            attempts.append(1)
+            return 42 if len(attempts) == 1 else {"calls": "data"}
+
+        result = prices.retry_fetch(
+            fetch,
+            describe="thing",
+            throttle=self.throttle(),
+            sleeper=lambda _: None,
+            # Probe assumes a sized payload; the malformed 42 makes it raise.
+            is_empty=lambda payload: len(payload) == 0,
+        )
+
+        assert result == {"calls": "data"}
+        assert len(attempts) == 2
+
+    def test_exhausted_retries_return_none(self):
+        result = prices.retry_fetch(
+            lambda: (_ for _ in ()).throw(ConnectionError("down")),
+            describe="thing",
+            throttle=self.throttle(),
+            sleeper=lambda _: None,
+            max_retries=2,
+        )
+
+        assert result is None

@@ -5,6 +5,12 @@
 
 Both commands exit non-zero on failure so a red Actions run is impossible to
 miss (SPEC.md §3.8).
+
+The full scan is two-pass by construction: per-symbol data first (signals,
+fundamentals, option economics, IV snapshot), then the cross-sectional pieces
+that need the whole universe at once — the forward-P/E percentile and the
+iv30/rv20 percentile that stands in for IV rank while a symbol's snapshot
+history is warming up (§6).
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -19,19 +26,29 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from leaps_scanner import db, indicators, prices, universe
+from leaps_scanner import db, fundamentals, indicators, options, prices, scoring, universe
 from leaps_scanner.config import ConfigError, load_env_file, load_settings
+from leaps_scanner.fundamentals import Fundamentals
 from leaps_scanner.indicators import InsufficientHistory, Signals
+from leaps_scanner.options import OptionsResult
 
 logger = logging.getLogger(__name__)
 
 COMMANDS = ("full", "refresh")
 
 # SPEC.md §9: losing more than a fifth of the universe means the scan does not
-# get to call itself complete.
+# get to call itself complete. Option-chain and fundamentals fetch failures
+# count toward the same ceiling — a row without option economics or with a
+# silently-empty financials payload is partial data too.
 MAX_MISSING_FRACTION = 0.20
 
-M2_NOTE = "M2: trend and weekly stochastic only; quality, valuation and IV filters land in M3."
+# Calendar window fetched for IV rank; scoring then uses the trailing
+# IV_RANK_WINDOW snapshots within it. 252 snapshots at M5's daily cadence
+# (5/week minus holidays) span ~367 calendar days, so the fetch window needs
+# headroom beyond a year or it would silently truncate the rank window.
+IV_HISTORY_DAYS = 420
+
+M3_NOTE = "M3: five filters, option economics and scoring; exit monitor lands in M5."
 
 
 @dataclass(frozen=True)
@@ -45,27 +62,74 @@ class ScanReport:
     matches_count: int
     status: str
     notes: str
-
-    @property
-    def missing_fraction(self) -> float:
-        return self.missing_count / self.universe_count if self.universe_count else 0.0
+    option_failures: int = 0
+    fundamentals_failures: int = 0
 
     @property
     def ok(self) -> bool:
         return self.status == db.STATUS_OK
 
 
-def is_match(signals: Signals) -> bool:
-    """The filters implemented so far: trend, plus the weekly stochastic entry.
+@dataclass(frozen=True)
+class IvContext:
+    """A symbol's IV-rank inputs after the cross-sectional pass (§6)."""
 
-    Quality, valuation and IV join this in M3; until then `matches_count` counts
-    what has actually been evaluated rather than implying a full five-filter pass.
+    value: float | None
+    status: str
+
+
+def earnings_distance(next_earnings: date | None, as_of: date) -> int | None:
+    """Days from the scan date to the next earnings, or None if unknown.
+
+    A date at or before `as_of` is a stale calendar entry, not a next earnings
+    date; it is treated as unknown rather than as "earnings today".
     """
-    return signals.trend_pass and signals.in_zone and signals.turning_up
+    if next_earnings is None or next_earnings <= as_of:
+        return None
+    return (next_earnings - as_of).days
 
 
-def build_scan_row(scan_id: int, symbol: str, signals: Signals) -> dict:
-    """One `scan_results` row. Columns owned by later milestones stay unset."""
+def build_scan_row(
+    scan_id: int,
+    symbol: str,
+    signals: Signals,
+    *,
+    fundamentals: Fundamentals,
+    options_result: OptionsResult | None,
+    iv_context: IvContext,
+    fwd_pe_percentile: float | None,
+    as_of: date,
+) -> dict:
+    """One complete `scan_results` row: signals, fundamentals snapshot,
+    contract economics, subscores, composite and preset flags.
+
+    Pure — everything cross-sectional arrives precomputed — so the golden-file
+    test can pin an entire row from fixed inputs.
+    """
+    contract = options_result.contract if options_result is not None else None
+    iv30 = options_result.iv30 if options_result is not None else None
+    earnings_dte = earnings_distance(fundamentals.next_earnings, as_of)
+    upside_adj = scoring.upside_adjusted(fundamentals.analyst_target, signals.spot)
+
+    s_trend = scoring.trend_score(signals)
+    s_quality, quality_all_present = scoring.quality_score(fundamentals)
+    s_option = scoring.option_score(contract, iv30, iv_context.value)
+    s_valuation = scoring.valuation_score(upside_adj, fwd_pe_percentile)
+    s_entry = scoring.entry_score(signals.stoch_k, signals.weeks_since_cross_up)
+    score = scoring.composite_score(s_trend, s_quality, s_option, s_valuation, s_entry)
+
+    presets = scoring.preset_flags(
+        trend_pass=signals.trend_pass,
+        stoch_k=signals.stoch_k,
+        turning_up=signals.turning_up,
+        iv_rank_value=iv_context.value,
+        earnings_dte=earnings_dte,
+        spread_pct=contract.spread_pct if contract else None,
+        oi=contract.oi if contract else None,
+        s_quality=s_quality,
+        quality_all_present=quality_all_present,
+    )
+
     return {
         "scan_id": scan_id,
         "symbol": symbol,
@@ -79,6 +143,47 @@ def build_scan_row(scan_id: int, symbol: str, signals: Signals) -> dict:
         "turning_up": signals.turning_up,
         "in_zone": signals.in_zone,
         "trend_pass": signals.trend_pass,
+        # Standalone checklist booleans — M3 addendum thresholds (scoring.py).
+        "quality_pass": s_quality is not None and s_quality >= scoring.QUALITY_PASS_MIN,
+        "valuation_pass": upside_adj is not None and upside_adj > 0,
+        "iv_pass": iv_context.value is not None and iv_context.value <= scoring.IV_PASS_MAX,
+        "passes_strict": presets.strict,
+        "passes_balanced": presets.balanced,
+        "passes_wide": presets.wide,
+        "s_trend": s_trend,
+        "s_quality": s_quality,
+        "s_option": s_option,
+        "s_valuation": s_valuation,
+        "s_entry": s_entry,
+        "score": score,
+        "op_margin": fundamentals.op_margin,
+        "roe": fundamentals.roe,
+        "net_debt_ebitda": fundamentals.net_debt_ebitda,
+        "rev_growth": fundamentals.rev_growth,
+        "fcf_margin": fundamentals.fcf_margin,
+        "fwd_pe": fundamentals.fwd_pe,
+        "analyst_target": fundamentals.analyst_target,
+        "upside_adj": upside_adj,
+        "opt_expiry": contract.expiry.isoformat() if contract else None,
+        "opt_strike": contract.strike if contract else None,
+        "opt_dte": contract.dte if contract else None,
+        "opt_delta": contract.delta if contract else None,
+        "opt_mid": contract.mid if contract else None,
+        "opt_bid": contract.bid if contract else None,
+        "opt_ask": contract.ask if contract else None,
+        "opt_spread_pct": contract.spread_pct if contract else None,
+        "opt_oi": contract.oi if contract else None,
+        "opt_iv": contract.iv if contract else None,
+        "breakeven": contract.breakeven if contract else None,
+        "breakeven_pct": contract.breakeven_pct if contract else None,
+        "cost_pct_spot": contract.cost_pct_spot if contract else None,
+        "iv30": iv30,
+        "iv_rank": iv_context.value,
+        "iv_rank_status": iv_context.status,
+        "next_earnings": (
+            fundamentals.next_earnings.isoformat() if earnings_dte is not None else None
+        ),
+        "earnings_dte": earnings_dte,
     }
 
 
@@ -108,10 +213,32 @@ def expected_as_of_date(today: date | None = None) -> date:
     return reference - timedelta(days=(reference.weekday() - 4) % 7)
 
 
-def assess(universe_count: int, evaluated_count: int) -> tuple[str, str]:
-    """Decide the scan's status from its coverage (SPEC.md §9)."""
+def assess(
+    universe_count: int,
+    evaluated_count: int,
+    option_failures: int = 0,
+    fundamentals_failures: int = 0,
+    data_failures: int | None = None,
+) -> tuple[str, str]:
+    """Decide the scan's status from its coverage (SPEC.md §9).
+
+    Every kind of gap is partial data: symbols with no price history, and
+    evaluated symbols whose option chains or fundamentals payloads never
+    arrived. (A chain that arrived but contained no valid contract is a
+    market fact, recorded as nulls, and does not count here.) `data_failures`
+    is the deduplicated count of evaluated symbols with either fetch failure;
+    it defaults to the sum when the caller has no overlap to deduplicate.
+    """
     missing = universe_count - evaluated_count
-    fraction = missing / universe_count if universe_count else 1.0
+    if data_failures is None:
+        data_failures = option_failures + fundamentals_failures
+    incomplete = missing + data_failures
+    fraction = incomplete / universe_count if universe_count else 1.0
+    detail = (
+        f"{missing}/{universe_count} symbols without price history, "
+        f"{option_failures} evaluated without option data, "
+        f"{fundamentals_failures} without fundamentals. {M3_NOTE}"
+    )
 
     if universe_count == 0:
         return db.STATUS_FAILED, "empty universe: no symbol cleared the market-cap floor"
@@ -119,11 +246,11 @@ def assess(universe_count: int, evaluated_count: int) -> tuple[str, str]:
     if fraction > MAX_MISSING_FRACTION:
         return (
             db.STATUS_FAILED,
-            f"{missing}/{universe_count} symbols ({fraction:.1%}) missing, "
-            f"over the {MAX_MISSING_FRACTION:.0%} ceiling. {M2_NOTE}",
+            f"{incomplete}/{universe_count} symbols ({fraction:.1%}) incomplete, "
+            f"over the {MAX_MISSING_FRACTION:.0%} ceiling. {detail}",
         )
 
-    return db.STATUS_OK, f"{missing}/{universe_count} symbols missing. {M2_NOTE}"
+    return db.STATUS_OK, detail
 
 
 def evaluate_all(frames: Mapping[str, pd.DataFrame]) -> dict[str, Signals]:
@@ -137,17 +264,76 @@ def evaluate_all(frames: Mapping[str, pd.DataFrame]) -> dict[str, Signals]:
     return signals
 
 
+def resolve_iv_contexts(
+    symbols: Sequence[str],
+    *,
+    history: Mapping[str, list[tuple[date, float]]],
+    iv30_by_symbol: Mapping[str, float | None],
+    rv20_by_symbol: Mapping[str, float | None],
+    as_of: date,
+) -> dict[str, IvContext]:
+    """§6 IV rank, cross-sectional pass.
+
+    A symbol with a current iv30 and ≥ 120 snapshots in the trailing window
+    gets the real rank; everyone else is warming up and gets the
+    cross-sectional percentile of iv30/rv20 substituted in its place (same
+    scale, same preset thresholds). A symbol with *no* current iv30 never
+    gets a rank at all — §6 defines the rank over the current value, and
+    stamping last week's rank `ok` in a row whose iv30 is null would assert
+    an IV fact the scan does not have. The current snapshot is appended in
+    memory when the history read predates this scan's write.
+    """
+    ratios: dict[str, float] = {}
+    for symbol in symbols:
+        iv30 = iv30_by_symbol.get(symbol)
+        rv20 = rv20_by_symbol.get(symbol)
+        if iv30 is not None and rv20 is not None and rv20 > 0:
+            ratios[symbol] = iv30 / rv20
+    population = list(ratios.values())
+
+    contexts: dict[str, IvContext] = {}
+    for symbol in symbols:
+        iv30 = iv30_by_symbol.get(symbol)
+        rank = None
+        if iv30 is not None:
+            series = list(history.get(symbol, []))
+            if not series or series[-1][0] != as_of:
+                series.append((as_of, iv30))
+            values = [value for _, value in series]
+            if len(values[-scoring.IV_RANK_WINDOW :]) >= scoring.IV_RANK_MIN_SNAPSHOTS:
+                rank = scoring.iv_rank(values)
+
+        if rank is not None:
+            contexts[symbol] = IvContext(value=rank, status=scoring.IV_RANK_STATUS_OK)
+        elif symbol in ratios:
+            contexts[symbol] = IvContext(
+                value=scoring.percentile_of(ratios[symbol], population),
+                status=scoring.IV_RANK_STATUS_WARMING,
+            )
+        else:
+            contexts[symbol] = IvContext(value=None, status=scoring.IV_RANK_STATUS_WARMING)
+    return contexts
+
+
 def run_full_scan(
     client,
     *,
     seed: Sequence[universe.SeedEntry] | None = None,
     market_cap_fetcher=universe.yahoo_market_cap,
     downloader=prices.yahoo_downloader,
+    fundamentals_fetcher=fundamentals.yahoo_fundamentals,
+    expiries_fetcher=options.yahoo_expiries,
+    chain_fetcher=options.yahoo_chain,
+    risk_free_fetcher=options.yahoo_risk_free_rate,
     min_market_cap: float = universe.MIN_MARKET_CAP,
+    sleeper=time.sleep,
 ) -> ScanReport:
-    """The weekly pipeline (SPEC.md §3, steps 1-2 and 6 as far as M2 goes).
+    """The weekly pipeline (SPEC.md §3, steps 1-6; the exit monitor is M5).
 
-    The `scans` row is opened before any work begins and closed in a `finally`,
+    `sleeper` backs every throttle and backoff in the run; tests pass a no-op
+    so the pipeline suite stays instant.
+
+    The `scans` row is opened before any work begins and closed in an `except`,
     so a run that dies mid-fetch leaves a `failed` row rather than no trace at
     all. Its `as_of_date` starts as the most recent Friday and is corrected once
     the signals say which week they actually describe.
@@ -160,7 +346,12 @@ def run_full_scan(
             seed=seed,
             market_cap_fetcher=market_cap_fetcher,
             downloader=downloader,
+            fundamentals_fetcher=fundamentals_fetcher,
+            expiries_fetcher=expiries_fetcher,
+            chain_fetcher=chain_fetcher,
+            risk_free_fetcher=risk_free_fetcher,
             min_market_cap=min_market_cap,
+            sleeper=sleeper,
         )
     except Exception as exc:
         db.finish_scan(
@@ -181,13 +372,18 @@ def _run_full_scan(
     seed: Sequence[universe.SeedEntry] | None,
     market_cap_fetcher,
     downloader,
+    fundamentals_fetcher,
+    expiries_fetcher,
+    chain_fetcher,
+    risk_free_fetcher,
     min_market_cap: float,
+    sleeper,
 ) -> ScanReport:
     entries = list(seed) if seed is not None else universe.load_seed()
     logger.info("seed list: %d symbols", len(entries))
 
     caps = universe.fetch_market_caps(
-        [entry.symbol for entry in entries], fetcher=market_cap_fetcher
+        [entry.symbol for entry in entries], fetcher=market_cap_fetcher, sleeper=sleeper
     )
     selected = universe.select_universe(entries, caps, min_market_cap=min_market_cap)
     logger.info("universe: %d symbols at or above %.0fB", len(selected), min_market_cap / 1e9)
@@ -206,31 +402,143 @@ def _run_full_scan(
         ],
     )
 
-    outcome = prices.fetch_daily_ohlcv([entry.symbol for entry in selected], downloader=downloader)
+    outcome = prices.fetch_daily_ohlcv(
+        [entry.symbol for entry in selected], downloader=downloader, sleeper=sleeper
+    )
     if outcome.failed:
         logger.warning("price fetch failed for %d symbols", len(outcome.failed))
 
     signals_by_symbol = evaluate_all(outcome.frames)
     logger.info("evaluated %d symbols", len(signals_by_symbol))
 
-    status, notes = assess(len(selected), len(signals_by_symbol))
     as_of = resolve_as_of_date(signals_by_symbol) if signals_by_symbol else expected_as_of_date()
-    matches = sum(1 for signal in signals_by_symbol.values() if is_match(signal))
+    symbols = sorted(signals_by_symbol)
 
-    db.write_scan_results(
+    funds_outcome = fundamentals.fetch_fundamentals(
+        symbols, fetcher=fundamentals_fetcher, sleeper=sleeper
+    )
+    funds = funds_outcome.results
+    if funds_outcome.failed:
+        logger.warning("fundamentals fetch failed for %d symbols", len(funds_outcome.failed))
+
+    options_outcome = options.OptionsOutcome(results={}, failed=())
+    if symbols:
+        # §5.2's r, fetched once. Without it no delta is computable for
+        # anyone, so a scan that cannot get it aborts (and is recorded as
+        # failed) rather than writing a universe of half-rows. Skipped
+        # entirely when nothing survived to be scored, so an empty-universe
+        # run reports the real root cause instead of a rate error.
+        rate = prices.retry_fetch(
+            risk_free_fetcher,
+            describe="risk-free rate (^IRX)",
+            throttle=prices.Throttle(sleeper=sleeper),
+            sleeper=sleeper,
+        )
+        if rate is None:
+            raise RuntimeError(
+                "risk-free rate (^IRX) unavailable; option deltas cannot be computed"
+            )
+
+        options_outcome = options.fetch_options(
+            [
+                options.OptionQuery(
+                    symbol=symbol,
+                    spot=signals_by_symbol[symbol].spot,
+                    dividend_yield=funds[symbol].dividend_yield,
+                )
+                for symbol in symbols
+            ],
+            today=as_of,
+            r=rate,
+            expiries_fetcher=expiries_fetcher,
+            chain_fetcher=chain_fetcher,
+            sleeper=sleeper,
+        )
+        if options_outcome.failed:
+            logger.warning("option chain fetch failed for %d symbols", len(options_outcome.failed))
+
+    iv30_by_symbol = {symbol: result.iv30 for symbol, result in options_outcome.results.items()}
+    rv20_by_symbol = {
+        symbol: options.realized_vol_20d(
+            outcome.frames[symbol].loc[: pd.Timestamp(signals_by_symbol[symbol].as_of_date)][
+                "Close"
+            ]
+        )
+        for symbol in symbols
+    }
+
+    # §3.5: snapshot first, then read the window back — so the current value
+    # is part of its own 252-snapshot range and a rerun stays idempotent.
+    db.upsert_iv_snapshots(
         client,
         [
-            build_scan_row(scan_id, symbol, signal)
-            for symbol, signal in sorted(signals_by_symbol.items())
+            {
+                "symbol": symbol,
+                "snap_date": as_of.isoformat(),
+                "iv30": iv30_by_symbol.get(symbol),
+                "rv20": rv20_by_symbol.get(symbol),
+            }
+            for symbol in symbols
+            if iv30_by_symbol.get(symbol) is not None or rv20_by_symbol.get(symbol) is not None
         ],
     )
+    history = db.fetch_iv_history(
+        client, since=as_of - timedelta(days=IV_HISTORY_DAYS), until=as_of
+    )
+    iv_contexts = resolve_iv_contexts(
+        symbols,
+        history=history,
+        iv30_by_symbol=iv30_by_symbol,
+        rv20_by_symbol=rv20_by_symbol,
+        as_of=as_of,
+    )
+
+    # Cross-sectional forward-P/E percentile (§6 Valuation).
+    pe_population = [funds[s].fwd_pe for s in symbols if funds[s].fwd_pe is not None]
+    fwd_pe_percentiles = {
+        symbol: (
+            scoring.percentile_of(funds[symbol].fwd_pe, pe_population)
+            if funds[symbol].fwd_pe is not None
+            else None
+        )
+        for symbol in symbols
+    }
+
+    rows = [
+        build_scan_row(
+            scan_id,
+            symbol,
+            signals_by_symbol[symbol],
+            fundamentals=funds[symbol],
+            options_result=options_outcome.results.get(symbol),
+            iv_context=iv_contexts[symbol],
+            fwd_pe_percentile=fwd_pe_percentiles[symbol],
+            as_of=as_of,
+        )
+        for symbol in symbols
+    ]
+    # matches_count = the Wide preset, the loosest §6 tier — "anything worth a
+    # look". (Rows from scans 1-3 predate M3 and counted trend+zone+turning
+    # instead; the column is not comparable across that boundary.)
+    matches = sum(1 for row in rows if row["passes_wide"])
+    # A symbol can fail both fetches; the ceiling counts it once.
+    data_failures = len(set(options_outcome.failed) | set(funds_outcome.failed))
+    status, notes = assess(
+        len(selected),
+        len(signals_by_symbol),
+        option_failures=len(options_outcome.failed),
+        fundamentals_failures=len(funds_outcome.failed),
+        data_failures=data_failures,
+    )
+
+    db.write_scan_results(client, rows)
     # Average volume comes from the history just fetched rather than a second
     # lookup, so it is always consistent with the bars the signals used.
     db.upsert_tickers(
         client,
         [
-            {"symbol": symbol, "avg_volume_30d": signal.avg_volume_30d}
-            for symbol, signal in sorted(signals_by_symbol.items())
+            {"symbol": symbol, "avg_volume_30d": signals_by_symbol[symbol].avg_volume_30d}
+            for symbol in symbols
         ],
     )
     db.finish_scan(
@@ -251,6 +559,8 @@ def _run_full_scan(
         matches_count=matches,
         status=status,
         notes=notes,
+        option_failures=len(options_outcome.failed),
+        fundamentals_failures=len(funds_outcome.failed),
     )
 
 

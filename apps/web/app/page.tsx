@@ -56,14 +56,15 @@ export default async function ScreenerPage() {
       <section>
         <h1 className="text-2xl font-semibold tracking-tight">Screener</h1>
         <p className="mt-2 max-w-2xl text-sm leading-relaxed text-[var(--muted)]">
-          US large caps that clear five filters — trend, weekly stochastic, quality, valuation
-          upside, and low implied volatility — ranked by a composite score shown raw, with no
-          curve applied.
+          US large caps screened for LEAPS call entries and scored on trend, quality, option
+          economics, valuation upside, and entry timing — a composite shown raw, with no curve
+          applied. Preset tiers (Strict / Balanced / Wide) apply the hard filters.
         </p>
         {latest.state === "ok" && (
           <p className="mt-3 text-xs text-[var(--muted)]">
             As of {formatAsOf(latest.scan.as_of_date)} · {latest.scan.matches_count ?? 0} of{" "}
-            {latest.scan.universe_count ?? 0} names matched · data: Yahoo Finance, delayed
+            {latest.scan.universe_count ?? 0} names pass the Wide preset · data: Yahoo Finance,
+            delayed
           </p>
         )}
       </section>
