@@ -126,7 +126,12 @@ export async function loadScreener(): Promise<Loaded<ScreenerData | null>> {
     const symbols = rows.map((row) => row.symbol);
     const [tickers, bars] = await Promise.all([
       loadTickersFor(client, symbols),
-      loadBarsFor(client, symbols, weeksBefore(scan.as_of_date, SPARKLINE_WEEKS)),
+      loadBarsFor(
+        client,
+        symbols,
+        weeksBefore(scan.as_of_date, SPARKLINE_WEEKS),
+        scan.as_of_date,
+      ),
     ]);
 
     const sparklines: Record<string, number[]> = {};
@@ -169,7 +174,12 @@ export async function loadTicker(symbol: string): Promise<Loaded<TickerData | nu
 
     const [tickers, bars] = await Promise.all([
       loadTickersFor(client, [symbol]),
-      loadBarsFor(client, [symbol], weeksBefore(scan.as_of_date, DETAIL_WEEKS)),
+      loadBarsFor(
+        client,
+        [symbol],
+        weeksBefore(scan.as_of_date, DETAIL_WEEKS),
+        scan.as_of_date,
+      ),
     ]);
 
     return { scan, row, ticker: tickers[symbol] ?? null, bars };
@@ -224,10 +234,23 @@ async function loadTickersFor(
   return Object.fromEntries(rows.map((row) => [row.symbol, row]));
 }
 
+/**
+ * Bars for a set of symbols, bounded at both ends.
+ *
+ * The upper bound is the load-bearing one. `weekly_bars` is keyed by
+ * (symbol, week_ending) rather than by scan, and the scanner writes it before
+ * `finish_scan` decides whether the run counts — so a scan that then fails
+ * §9's 20% ceiling still leaves its bars behind. These pages deliberately show
+ * the latest *successful* scan, so without `until` the chart would draw a
+ * candle for a week the header, checklist and economics beside it know nothing
+ * about. Clamping to the displayed scan's `as_of_date` keeps the page one
+ * self-consistent statement about one week.
+ */
 async function loadBarsFor(
   client: NonNullable<ReturnType<typeof createReadClient>>,
   symbols: string[],
   since: string,
+  until: string,
 ): Promise<WeeklyBar[]> {
   if (symbols.length === 0) return [];
 
@@ -237,6 +260,7 @@ async function loadBarsFor(
       .select("*")
       .in("symbol", symbols)
       .gte("week_ending", since)
+      .lte("week_ending", until)
       .order("symbol")
       .order("week_ending")
       .range(from, to),

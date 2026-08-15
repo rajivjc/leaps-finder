@@ -125,6 +125,20 @@ export function isShortDatedFallback(dte: number | null): boolean {
   return dte !== null && dte < LEAP_MIN_DTE;
 }
 
+/**
+ * The standalone checklist thresholds (the M3 addenda recorded in the scanner's
+ * `scoring.py` docstring, not values SPEC.md pins).
+ *
+ * `scoring.py` is the source of truth: it computes the `quality_pass` / `iv_pass`
+ * booleans the UI renders as ticks and crosses. These copies exist only so the
+ * checklist can say *how close* a name was — and if they ever drift, the page
+ * would explain a red cross with a comparison that reads as passing. A test
+ * (`metrics.test.ts`) parses `scoring.py` and fails on divergence, so the copy
+ * cannot rot silently.
+ */
+export const QUALITY_PASS_MIN = 45;
+export const IV_PASS_MAX = 50;
+
 /** SPEC.md §7: earnings inside 21 days is the informational amber flag. */
 export const EARNINGS_WARN_DAYS = 21;
 

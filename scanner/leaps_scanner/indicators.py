@@ -222,12 +222,18 @@ def weekly_history(
     daily: pd.DataFrame,
     today: date | None = None,
     weeks: int = WEEKLY_HISTORY_WEEKS,
+    through: date | None = None,
 ) -> list[WeeklyBar]:
     """The chart series for one symbol: completed weekly bars, newest last.
 
-    Same inputs and same cutoff as `evaluate`, so the last bar returned here is
-    the bar the scan's signals were read from — the chart cannot disagree with
-    the row beside it.
+    `through` caps the newest bar returned, and is what actually holds the
+    invariant that the chart agrees with the scan row beside it. Deriving the
+    cutoff from `today` alone is not enough: the caller evaluates signals at one
+    moment and builds this series minutes later, so a run straddling local
+    midnight would evaluate with today=Friday (dropping the week) and then build
+    bars with today=Saturday (keeping it), writing a chart a week ahead of every
+    row from the same scan. Passing the scan's resolved `as_of` removes that
+    dependence on wall-clock timing entirely.
 
     The stochastic and the moving averages are computed over the *whole*
     available history and only then sliced to `weeks`. Slicing first would leave
@@ -239,6 +245,10 @@ def weekly_history(
 
     daily = daily.sort_index()
     weekly = completed_weekly_bars(daily, today=today)
+    if through is not None:
+        # Truncate before the indicators are computed so a trimmed bar cannot
+        # influence the ones that remain.
+        weekly = weekly.loc[weekly.index <= pd.Timestamp(through)]
     if weekly.empty:
         return []
 

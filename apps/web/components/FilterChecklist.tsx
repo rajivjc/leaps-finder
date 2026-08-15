@@ -12,11 +12,8 @@
  */
 
 import { EM_DASH, fmtPercent, fmtScore, fmtUsd } from "@/lib/format";
+import { IV_PASS_MAX, QUALITY_PASS_MIN } from "@/lib/metrics";
 import type { ScanResult } from "@/lib/types";
-
-/** M3 addendum thresholds, recorded in the scanner's `scoring.py` docstring. */
-const QUALITY_PASS_MIN = 45;
-const IV_PASS_MAX = 50;
 
 type Check = { label: string; pass: boolean | null; reason: string };
 

@@ -342,3 +342,36 @@ class TestWeeklyHistory:
     def test_empty_history_yields_no_bars_rather_than_raising(self):
         # Unlike `evaluate`, a chart with nothing to draw is not an error.
         assert indicators.weekly_history(daily_frame(0)) == []
+
+    def test_through_caps_the_newest_bar(self):
+        daily = daily_frame(400, end="2026-08-14")
+
+        bars = indicators.weekly_history(daily, through=date(2026, 7, 24))
+
+        assert bars[-1].week_ending == date(2026, 7, 24)
+
+    def test_through_pins_the_series_against_a_clock_that_moved(self):
+        # The scan evaluates signals and writes bars minutes apart. A run
+        # straddling local midnight sees today=Friday for one and Saturday for
+        # the other, which without `through` would write a chart one week ahead
+        # of the rows from the same scan.
+        daily = daily_frame(400, end="2026-08-14")
+        as_of = indicators.evaluate(daily, today=date(2026, 8, 14)).as_of_date
+
+        during_friday = indicators.weekly_history(daily, today=date(2026, 8, 14), through=as_of)
+        after_midnight = indicators.weekly_history(daily, today=date(2026, 8, 15), through=as_of)
+
+        assert during_friday[-1].week_ending == as_of
+        assert after_midnight[-1].week_ending == as_of
+
+    def test_truncation_does_not_alter_the_bars_that_remain(self):
+        # Trimming happens before the indicators are computed, so a bar's
+        # stochastic never depends on data from after the scan's own week.
+        daily = daily_frame(400, end="2026-08-14")
+        cutoff = date(2026, 7, 24)
+
+        capped = indicators.weekly_history(daily, through=cutoff)
+        full = {bar.week_ending: bar for bar in indicators.weekly_history(daily)}
+
+        assert capped[-1].slow_k == pytest.approx(full[cutoff].slow_k)
+        assert capped[-1].sma200 == pytest.approx(full[cutoff].sma200)

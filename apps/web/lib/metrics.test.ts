@@ -8,10 +8,19 @@
  * whatever the code currently does.
  */
 
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import { EM_DASH, fmtPercent, fmtScore, fmtUsd } from "@/lib/format";
-import { cushion, positionSize, targetAdjusted } from "@/lib/metrics";
+import {
+  IV_PASS_MAX,
+  QUALITY_PASS_MIN,
+  cushion,
+  positionSize,
+  targetAdjusted,
+} from "@/lib/metrics";
 
 function row(spot: number | null, upside: number | null, breakeven: number | null) {
   return { spot, upside_adj: upside, breakeven };
@@ -99,6 +108,32 @@ describe("positionSize (SPEC §7)", () => {
     expect(positionSize(0, 12.5)).toBeNull();
     expect(positionSize(-100, 12.5)).toBeNull();
     expect(positionSize(100_000, 0)).toBeNull();
+  });
+});
+
+describe("checklist thresholds stay in step with the scanner", () => {
+  // The ticks and crosses on the ticker page come from `quality_pass` /
+  // `iv_pass`, which the scanner computes from these constants; the sentence
+  // beside each one is written here. If the two drift, the page explains a red
+  // cross with a comparison that reads as passing — so the drift fails a test
+  // instead of shipping.
+  const scoringPy = readFileSync(
+    fileURLToPath(new URL("../../../scanner/leaps_scanner/scoring.py", import.meta.url)),
+    "utf8",
+  );
+
+  function constantIn(source: string, name: string): number {
+    const match = source.match(new RegExp(`^${name}\\s*=\\s*([0-9.]+)`, "m"));
+    if (!match) throw new Error(`${name} not found in scoring.py`);
+    return Number(match[1]);
+  }
+
+  it("matches scoring.QUALITY_PASS_MIN", () => {
+    expect(QUALITY_PASS_MIN).toBe(constantIn(scoringPy, "QUALITY_PASS_MIN"));
+  });
+
+  it("matches scoring.IV_PASS_MAX", () => {
+    expect(IV_PASS_MAX).toBe(constantIn(scoringPy, "IV_PASS_MAX"));
   });
 });
 

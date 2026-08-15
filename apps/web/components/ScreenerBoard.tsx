@@ -90,6 +90,13 @@ function test(
 const atLeast = (value: number, bound: number) => value >= bound;
 const atMost = (value: number, bound: number) => value <= bound;
 
+/** The categorical sibling of `test`, with the same three-way result. */
+function testSector(selected: string, sector: string | null | undefined): Outcome {
+  if (!selected) return "keep";
+  if (sector === null || sector === undefined) return "unknown";
+  return sector === selected ? "keep" : "drop";
+}
+
 export function ScreenerBoard({
   rows,
   tickers,
@@ -149,9 +156,14 @@ export function ScreenerBoard({
       if (row[field] !== true) continue;
 
       const ticker = tickers[row.symbol];
-      if (filters.sector && ticker?.sector !== filters.sector) continue;
 
       const outcomes: Outcome[] = [
+        // Sector goes through the same three-way accounting as every numeric
+        // bound: `tickers.sector` is nullable, and a name whose sector never
+        // arrived from Yahoo cannot answer "is this a Financials name?" either
+        // way. Dropping it outright would make it vanish with no trace, which
+        // is exactly the silent exclusion the counting below exists to prevent.
+        testSector(filters.sector, ticker?.sector),
         test(bounds.stochMin, row.stoch_k, atLeast),
         test(bounds.stochMax, row.stoch_k, atMost),
         test(bounds.ivRankMax, row.iv_rank, atMost),
