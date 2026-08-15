@@ -22,3 +22,7 @@ next-env.d.ts
 
 # OS
 .DS_Store
+
+# Python build artifacts
+build/
+dist/

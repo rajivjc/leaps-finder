@@ -52,15 +52,19 @@ Requires Python 3.11+, Node 22+, and [uv](https://docs.astral.sh/uv/).
 make setup
 ```
 
-Then create a Supabase project, apply the migrations in `supabase/migrations/` in order, and
-fill in the two env files:
+Then follow **[docs/SETUP.md](docs/SETUP.md)** to create a Supabase project, apply the
+migrations, verify the security policies, and get the keys to the four places they belong. It
+takes about fifteen minutes and covers what to do if a key ever leaks.
+
+The short version: apply `supabase/migrations/` in order, then fill in the two env files.
 
 ```bash
 cp scanner/.env.example scanner/.env        # SUPABASE_URL, SUPABASE_SERVICE_KEY
 cp apps/web/.env.example apps/web/.env.local # NEXT_PUBLIC_* pair
 ```
 
-Neither file is tracked. This repo is public — no key of any kind belongs in a commit.
+Neither file is tracked. This repo is public — no key of any kind belongs in a commit, and the
+service key belongs only in those two places and GitHub Actions secrets.
 
 ```bash
 make web      # dev server on :3000
@@ -69,12 +73,24 @@ make lint     # ruff + eslint + tsc
 make test     # pytest
 ```
 
+## How a scan decides
+
+The scanner reads the bundled S&P 500 seed list, keeps names at $50B or more of market cap,
+pulls two years of daily bars for each, and evaluates them at the close of the **last completed
+week**. The in-progress week is dropped before any signal is computed, so a Tuesday rerun
+reproduces Saturday's numbers exactly — nothing repaints.
+
+A symbol without enough history to define every signal is excluded rather than approximated,
+and a 10-week window with no range yields no stochastic rather than an invented midpoint. If
+more than 20% of the universe ends up missing for any reason, the scan is recorded as `failed`
+and the screener will not display it. Partial data never looks complete.
+
 ## Status
 
 Built milestone by milestone against [SPEC.md §11](SPEC.md).
 
 - [x] **M1 Scaffold** — monorepo, migrations + RLS, Next.js shell with Supabase client, CI
-- [ ] **M2 Scanner core** — universe, prices, indicators, `scan_results` writes
+- [x] **M2 Scanner core** — universe, prices, indicators, `scan_results` writes, weekly cron
 - [ ] **M3 Options + scoring** — chain selection, Black-Scholes delta, IV snapshots, presets
 - [ ] **M4 Frontend** — screener, ticker detail, compare
 - [ ] **M5 Risk** — auth, positions, size calculator, exit monitor and alerts
