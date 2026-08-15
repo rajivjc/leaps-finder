@@ -14,6 +14,7 @@ import random
 import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 import pandas as pd
 
@@ -76,12 +77,23 @@ def batched(items: Sequence[str], size: int = BATCH_SIZE) -> list[list[str]]:
     return [list(items[i : i + size]) for i in range(0, len(items), size)]
 
 
+@lru_cache(maxsize=1)
+def shared_session():
+    """One curl_cffi session for the whole run.
+
+    A fresh session per request means a fresh TLS handshake per request, which
+    is both slow and a good way to look like something worth rate-limiting.
+    """
+    import curl_cffi
+
+    return curl_cffi.requests.Session(impersonate="chrome")
+
+
 def yahoo_downloader(symbols: Sequence[str], period: str) -> pd.DataFrame:
     """Default downloader: one batched yfinance request over a curl_cffi session."""
-    import curl_cffi
     import yfinance as yf
 
-    session = curl_cffi.requests.Session(impersonate="chrome")
+    session = shared_session()
     return yf.download(
         tickers=list(symbols),
         period=period,
@@ -149,7 +161,7 @@ def fetch_daily_ohlcv(
     failed: list[str] = []
 
     for batch in batched(ordered, batch_size):
-        raw = _download_with_retries(
+        fetched = _fetch_batch_with_retries(
             batch,
             period=period,
             downloader=downloader,
@@ -158,18 +170,13 @@ def fetch_daily_ohlcv(
             rng=jitter,
             max_retries=max_retries,
         )
-        if raw is None:
-            failed.extend(batch)
-            continue
-
-        fetched = split_batch_frame(raw, batch)
         frames.update(fetched)
         failed.extend(symbol for symbol in batch if symbol not in fetched)
 
     return FetchOutcome(frames=frames, failed=tuple(failed))
 
 
-def _download_with_retries(
+def _fetch_batch_with_retries(
     batch: Sequence[str],
     *,
     period: str,
@@ -178,22 +185,38 @@ def _download_with_retries(
     sleeper: Callable[[float], None],
     rng: random.Random,
     max_retries: int,
-) -> pd.DataFrame | None:
+) -> dict[str, pd.DataFrame]:
+    """Download one batch, retrying until it yields something usable.
+
+    yfinance reports most failures — rate limiting included — by returning an
+    empty frame rather than raising, so retrying only on exceptions would leave
+    the common case unretried. A batch that comes back with nothing usable is
+    therefore treated exactly like a transport error. A batch that returns
+    *some* symbols is accepted as-is: the absent ones are far more likely to be
+    delisted than throttled, and retrying the whole batch to chase them would
+    cost more requests than it saves.
+    """
     for attempt in range(max_retries):
         throttle.wait()
         try:
-            return downloader(batch, period)
+            raw = downloader(batch, period)
         except Exception as exc:  # noqa: BLE001 - any transport error is retryable
-            last_attempt = attempt == max_retries - 1
-            logger.warning(
-                "batch of %d failed (attempt %d/%d): %s",
-                len(batch),
-                attempt + 1,
-                max_retries,
-                exc,
-            )
-            if last_attempt:
-                return None
-            sleeper(BACKOFF_BASE_SECONDS * (2**attempt) + rng.uniform(0, BACKOFF_JITTER_SECONDS))
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            fetched = split_batch_frame(raw, batch)
+            if fetched:
+                return fetched
+            reason = "empty response"
 
-    return None
+        logger.warning(
+            "batch of %d yielded nothing (attempt %d/%d): %s",
+            len(batch),
+            attempt + 1,
+            max_retries,
+            reason,
+        )
+        if attempt == max_retries - 1:
+            return {}
+        sleeper(BACKOFF_BASE_SECONDS * (2**attempt) + rng.uniform(0, BACKOFF_JITTER_SECONDS))
+
+    return {}

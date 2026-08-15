@@ -10,6 +10,8 @@ the range 100 and collapses
 to `Close - 100`.
 """
 
+from datetime import date
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -145,10 +147,29 @@ class TestCompletedWeeklyBars:
     def test_friday_close_completes_the_week(self):
         daily = daily_frame(400, end="2026-08-14")
 
-        weekly = indicators.completed_weekly_bars(daily)
+        # Read the following day: Friday's session is over.
+        weekly = indicators.completed_weekly_bars(daily, today=date(2026, 8, 15))
 
         assert weekly.index[-1].date().isoformat() == "2026-08-14"
         assert len(weekly) == len(indicators.weekly_bars(daily))
+
+    def test_friday_mid_session_is_not_yet_complete(self):
+        # Running at lunchtime on Friday: today's bar is still being written,
+        # so the week must not count yet or the numbers repaint at the close.
+        daily = daily_frame(400, end="2026-08-14")
+
+        weekly = indicators.completed_weekly_bars(daily, today=date(2026, 8, 14))
+
+        assert weekly.index[-1].date().isoformat() == "2026-08-07"
+
+    def test_friday_run_and_saturday_run_agree_once_the_session_closed(self):
+        daily = daily_frame(400, end="2026-08-14")
+
+        friday_lunchtime = indicators.completed_weekly_bars(daily, today=date(2026, 8, 14))
+        saturday = indicators.completed_weekly_bars(daily, today=date(2026, 8, 15))
+
+        # The mid-session run is a week behind rather than showing a half-week.
+        assert friday_lunchtime.index[-1] < saturday.index[-1]
 
     def test_weekly_bar_aggregates_the_week_not_the_last_session(self):
         daily = daily_frame(400, end="2026-08-14")

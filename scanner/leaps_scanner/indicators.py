@@ -76,20 +76,28 @@ def weekly_bars(daily: pd.DataFrame) -> pd.DataFrame:
     return resampled.dropna(subset=["Close"])
 
 
-def completed_weekly_bars(daily: pd.DataFrame) -> pd.DataFrame:
+def completed_weekly_bars(daily: pd.DataFrame, today: date | None = None) -> pd.DataFrame:
     """Weekly bars with the in-progress week dropped (SPEC.md §4).
 
-    The final week is complete once the data has reached its Friday. When the
-    last session is Monday-Thursday the week is still trading, so its bar goes.
-    A Friday holiday makes this drop a week that had in fact finished on the
-    Thursday — one week stale, which is the safe direction to be wrong in.
+    A week is complete only when both hold:
+
+    * the data has reached its Friday — a last session of Monday-Thursday means
+      the week is still trading; and
+    * that session is not today — a bar dated today is still being written, and
+      Friday's bar mid-session would repaint at the close.
+
+    The second condition is what makes an ad-hoc Friday-lunchtime run agree with
+    the Saturday cron. A Friday holiday makes this drop a week that had in fact
+    finished on the Thursday: one week stale, which is the safe direction to be
+    wrong in.
     """
     weekly = weekly_bars(daily)
     if weekly.empty or daily.empty:
         return weekly
 
+    reference = date.today() if today is None else today
     last_session = daily.index[-1]
-    if last_session.weekday() < 4:  # Mon-Thu: this week is still open.
+    if last_session.weekday() < 4 or last_session.date() >= reference:
         return weekly.iloc[:-1]
     return weekly
 
@@ -150,7 +158,7 @@ def crosses_above(series: pd.Series, level: float) -> bool:
     return previous <= level and current > level
 
 
-def evaluate(daily: pd.DataFrame) -> Signals:
+def evaluate(daily: pd.DataFrame, today: date | None = None) -> Signals:
     """Compute every §4 signal for one symbol from its daily OHLCV history.
 
     Daily indicators are read at the close of the last completed week, not at
@@ -161,7 +169,7 @@ def evaluate(daily: pd.DataFrame) -> Signals:
         raise InsufficientHistory("no daily bars")
 
     daily = daily.sort_index()
-    weekly = completed_weekly_bars(daily)
+    weekly = completed_weekly_bars(daily, today=today)
 
     if len(weekly) < MIN_WEEKLY_BARS:
         raise InsufficientHistory(f"{len(weekly)} completed weekly bars, need {MIN_WEEKLY_BARS}")

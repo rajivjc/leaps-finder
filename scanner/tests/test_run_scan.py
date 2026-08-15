@@ -27,9 +27,10 @@ class FakeResponse:
 class FakeTable:
     """Records the PostgREST calls the scanner makes, in order."""
 
-    def __init__(self, name, log):
+    def __init__(self, name, log, fail_on=None):
         self._name = name
         self._log = log
+        self._fail_on = fail_on
         self._pending = None
 
     def insert(self, rows):
@@ -49,6 +50,8 @@ class FakeTable:
 
     def execute(self):
         verb, payload = self._pending
+        if self._fail_on == (self._name, verb):
+            raise RuntimeError(f"PostgREST 503 on {self._name}.{verb}")
         self._log.append((self._name, verb, payload))
         if self._name == "scans" and verb == "insert":
             return FakeResponse([{"id": 7}])
@@ -56,11 +59,12 @@ class FakeTable:
 
 
 class FakeClient:
-    def __init__(self):
+    def __init__(self, fail_on=None):
         self.calls = []
+        self._fail_on = fail_on
 
     def table(self, name):
-        return FakeTable(name, self.calls)
+        return FakeTable(name, self.calls, self._fail_on)
 
     def rows(self, table, verb):
         return [payload for name, v, payload in self.calls if name == table and v == verb]
@@ -375,6 +379,114 @@ class TestCli:
 
 
 class TestMinMarketCapWiring:
-    def test_pipeline_uses_the_spec_floor_by_default(self):
-        assert run_scan.run_full_scan.__defaults__ is None
+    def test_pipeline_applies_the_spec_floor_when_none_is_passed(self):
+        # Caps straddling $50B: only the one at or above it survives a call that
+        # does not override min_market_cap.
+        client = FakeClient()
+        seed = [
+            SeedEntry("BIG", "Big", "Information Technology", "Software"),
+            SeedEntry("SMALL", "Small", "Industrials", "Widgets"),
+        ]
+        caps = {"BIG": universe.MIN_MARKET_CAP, "SMALL": universe.MIN_MARKET_CAP - 1}
+
+        def downloader(symbols, period):
+            columns = pd.MultiIndex.from_product(
+                [list(symbols), ["Open", "High", "Low", "Close", "Volume"]]
+            )
+            frame = rising_frame()
+            return pd.DataFrame(
+                np.tile(frame.values, (1, len(symbols))), index=frame.index, columns=columns
+            )
+
+        report = run_scan.run_full_scan(
+            client, seed=seed, market_cap_fetcher=caps.get, downloader=downloader
+        )
+
+        assert report.universe_count == 1
+        assert [r["symbol"] for r in client.rows("scan_results", "upsert")[0]] == ["BIG"]
+
+    def test_the_floor_is_fifty_billion(self):
         assert universe.MIN_MARKET_CAP == 50e9
+
+
+class TestExpectedAsOfDate:
+    @pytest.mark.parametrize(
+        ("today", "expected"),
+        [
+            ("2026-08-15", "2026-08-14"),  # Saturday, the cron slot
+            ("2026-08-14", "2026-08-14"),  # Friday itself
+            ("2026-08-17", "2026-08-14"),  # Monday
+            ("2026-08-13", "2026-08-07"),  # Thursday: last week's Friday
+        ],
+    )
+    def test_resolves_to_the_most_recent_friday(self, today, expected):
+        resolved = run_scan.expected_as_of_date(pd.Timestamp(today).date())
+
+        assert resolved.isoformat() == expected
+        assert resolved.weekday() == 4
+
+
+class TestScanRowLifecycle:
+    SEED = [SeedEntry("AAA", "Alpha", "Information Technology", "Software")]
+
+    def test_scan_row_is_opened_before_any_fetching(self):
+        client = FakeClient()
+
+        def downloader(symbols, period):
+            # By the time a fetch happens, the scans row must already exist.
+            assert ("scans", "insert") in [(n, v) for n, v, _ in client.calls]
+            raise ConnectionError("yahoo down")
+
+        run_scan.run_full_scan(
+            client,
+            seed=self.SEED,
+            market_cap_fetcher={"AAA": 900e9}.get,
+            downloader=downloader,
+        )
+
+    def test_a_crash_mid_scan_still_closes_the_row_as_failed(self):
+        # Supabase goes down after the scan row is open. The run must not leave
+        # a row stuck at 'running' forever.
+        client = FakeClient(fail_on=("scan_results", "upsert"))
+
+        def downloader(symbols, period):
+            columns = pd.MultiIndex.from_product(
+                [list(symbols), ["Open", "High", "Low", "Close", "Volume"]]
+            )
+            frame = rising_frame()
+            return pd.DataFrame(
+                np.tile(frame.values, (1, len(symbols))), index=frame.index, columns=columns
+            )
+
+        with pytest.raises(RuntimeError):
+            run_scan.run_full_scan(
+                client,
+                seed=self.SEED,
+                market_cap_fetcher={"AAA": 900e9}.get,
+                downloader=downloader,
+            )
+
+        update = client.rows("scans", "update")[0]
+        assert update["status"] == db.STATUS_FAILED
+        assert "RuntimeError" in update["notes"]
+
+    def test_finish_corrects_the_provisional_date_from_the_signals(self):
+        client = FakeClient()
+
+        def downloader(symbols, period):
+            columns = pd.MultiIndex.from_product(
+                [list(symbols), ["Open", "High", "Low", "Close", "Volume"]]
+            )
+            frame = rising_frame()
+            return pd.DataFrame(
+                np.tile(frame.values, (1, len(symbols))), index=frame.index, columns=columns
+            )
+
+        report = run_scan.run_full_scan(
+            client,
+            seed=self.SEED,
+            market_cap_fetcher={"AAA": 900e9}.get,
+            downloader=downloader,
+        )
+
+        assert client.rows("scans", "update")[0]["as_of_date"] == report.as_of_date.isoformat()

@@ -155,6 +155,48 @@ class TestFetchDailyOhlcv:
         assert sorted(outcome.frames) == ["A", "B"]
         assert outcome.failed == ()
 
+    def test_empty_response_is_retried_like_a_transport_error(self):
+        # yfinance signals failure (rate limiting included) by returning an
+        # empty frame rather than raising. Retrying only on exceptions would
+        # leave the failure mode that actually happens unretried.
+        attempts = []
+
+        def downloader(symbols, period):
+            attempts.append(list(symbols))
+            if len(attempts) < 3:
+                return pd.DataFrame()
+            return ohlcv(len(symbols), symbols)
+
+        outcome = self._fetch(downloader, ["A", "B"], batch_size=2)
+
+        assert len(attempts) == 3
+        assert sorted(outcome.frames) == ["A", "B"]
+        assert outcome.failed == ()
+
+    def test_persistently_empty_batch_is_reported_failed(self):
+        def downloader(symbols, period):
+            return pd.DataFrame()
+
+        outcome = self._fetch(downloader, ["A", "B"], batch_size=2)
+
+        assert outcome.frames == {}
+        assert outcome.failed == ("A", "B")
+
+    def test_partial_batch_is_accepted_without_retrying_the_whole_batch(self):
+        # A symbol missing from an otherwise good response is far more likely
+        # delisted than throttled; chasing it would cost more than it saves.
+        attempts = []
+
+        def downloader(symbols, period):
+            attempts.append(list(symbols))
+            return ohlcv(2, ["A", "B"])  # "C" never appears
+
+        outcome = self._fetch(downloader, ["A", "B", "C"], batch_size=3)
+
+        assert len(attempts) == 1
+        assert sorted(outcome.frames) == ["A", "B"]
+        assert outcome.failed == ("C",)
+
     def test_gives_up_after_three_attempts_and_reports_the_symbols(self):
         attempts = []
 

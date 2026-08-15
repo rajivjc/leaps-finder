@@ -15,7 +15,7 @@ import sys
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import pandas as pd
 
@@ -96,6 +96,18 @@ def resolve_as_of_date(signals_by_symbol: Mapping[str, Signals]) -> date:
     return most_common[0]
 
 
+def expected_as_of_date(today: date | None = None) -> date:
+    """The Friday the scan is provisionally dated with, before signals exist.
+
+    The `scans` row is opened *before* any fetching so that a crashed run still
+    leaves a record, but `as_of_date` is not null — so the row starts with the
+    most recent Friday and `finish_scan` corrects it from the actual signals.
+    """
+    reference = date.today() if today is None else today
+    # weekday(): Mon=0 .. Fri=4. Saturday (the cron slot) resolves to yesterday.
+    return reference - timedelta(days=(reference.weekday() - 4) % 7)
+
+
 def assess(universe_count: int, evaluated_count: int) -> tuple[str, str]:
     """Decide the scan's status from its coverage (SPEC.md §9)."""
     missing = universe_count - evaluated_count
@@ -133,7 +145,44 @@ def run_full_scan(
     downloader=prices.yahoo_downloader,
     min_market_cap: float = universe.MIN_MARKET_CAP,
 ) -> ScanReport:
-    """The weekly pipeline (SPEC.md §3, steps 1-2 and 6 as far as M2 goes)."""
+    """The weekly pipeline (SPEC.md §3, steps 1-2 and 6 as far as M2 goes).
+
+    The `scans` row is opened before any work begins and closed in a `finally`,
+    so a run that dies mid-fetch leaves a `failed` row rather than no trace at
+    all. Its `as_of_date` starts as the most recent Friday and is corrected once
+    the signals say which week they actually describe.
+    """
+    scan_id = db.start_scan(client, "full", expected_as_of_date())
+    try:
+        return _run_full_scan(
+            client,
+            scan_id,
+            seed=seed,
+            market_cap_fetcher=market_cap_fetcher,
+            downloader=downloader,
+            min_market_cap=min_market_cap,
+        )
+    except Exception as exc:
+        db.finish_scan(
+            client,
+            scan_id,
+            status=db.STATUS_FAILED,
+            universe_count=0,
+            matches_count=0,
+            notes=f"scan aborted: {type(exc).__name__}: {exc}",
+        )
+        raise
+
+
+def _run_full_scan(
+    client,
+    scan_id: int,
+    *,
+    seed: Sequence[universe.SeedEntry] | None,
+    market_cap_fetcher,
+    downloader,
+    min_market_cap: float,
+) -> ScanReport:
     entries = list(seed) if seed is not None else universe.load_seed()
     logger.info("seed list: %d symbols", len(entries))
 
@@ -165,10 +214,9 @@ def run_full_scan(
     logger.info("evaluated %d symbols", len(signals_by_symbol))
 
     status, notes = assess(len(selected), len(signals_by_symbol))
-    as_of = resolve_as_of_date(signals_by_symbol) if signals_by_symbol else date.today()
+    as_of = resolve_as_of_date(signals_by_symbol) if signals_by_symbol else expected_as_of_date()
     matches = sum(1 for signal in signals_by_symbol.values() if is_match(signal))
 
-    scan_id = db.start_scan(client, "full", as_of)
     db.write_scan_results(
         client,
         [
@@ -192,6 +240,7 @@ def run_full_scan(
         universe_count=len(selected),
         matches_count=matches,
         notes=notes,
+        as_of_date=as_of,
     )
 
     return ScanReport(

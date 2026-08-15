@@ -61,26 +61,27 @@ def finish_scan(
     universe_count: int,
     matches_count: int,
     notes: str | None = None,
+    as_of_date: date | None = None,
 ) -> None:
     """Close out a `scans` row.
 
     A scan is only ever `ok` when the caller says so; partial data is recorded
     as `failed` (SPEC.md §9) precisely so it cannot be mistaken for a full run.
+
+    `as_of_date` corrects the provisional date the row was opened with, once the
+    signals have revealed which week the scan actually speaks for.
     """
-    (
-        client.table("scans")
-        .update(
-            {
-                "finished_at": _now(),
-                "status": status,
-                "universe_count": universe_count,
-                "matches_count": matches_count,
-                "notes": notes,
-            }
-        )
-        .eq("id", scan_id)
-        .execute()
-    )
+    payload = {
+        "finished_at": _now(),
+        "status": status,
+        "universe_count": universe_count,
+        "matches_count": matches_count,
+        "notes": notes,
+    }
+    if as_of_date is not None:
+        payload["as_of_date"] = as_of_date.isoformat()
+
+    client.table("scans").update(payload).eq("id", scan_id).execute()
 
 
 def upsert_tickers(client: Client, rows: Sequence[dict[str, Any]]) -> None:
