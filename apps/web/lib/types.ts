@@ -14,7 +14,9 @@ export type AlertKind =
   | "stoch_below_20"
   | "premium_stop"
   | "time_exit"
-  | "earnings_soon";
+  | "earnings_soon"
+  /** Sleeve-level, so it carries no `position_id` (migration 0004). */
+  | "circuit_breaker";
 
 export type Ticker = {
   symbol: string;
@@ -134,15 +136,46 @@ export type Position = {
   exit_premium: number | null;
   exit_reason: string | null;
   created_at: string | null;
+  /**
+   * SPEC.md §7: the sizing caps are warnings the owner may override, and the
+   * override is logged. Null means the entry breached nothing.
+   */
+  sizing_override: string | null;
 };
 
 export type Alert = {
   id: number;
+  user_id: string;
   position_id: number | null;
   created_at: string | null;
   kind: AlertKind | null;
   message: string | null;
   acknowledged: boolean | null;
+  /**
+   * Provenance (migration 0004): the run and the trading day the alert was
+   * computed from. Without these an alert's message is an assertion with no
+   * date attached to it.
+   */
+  scan_id: number | null;
+  as_of_date: string | null;
+};
+
+/** One day's quote for a held contract (SPEC.md §7's premium stop). */
+export type PositionMark = {
+  position_id: number;
+  mark_date: string;
+  scan_id: number | null;
+  bid: number | null;
+  ask: number | null;
+  mid: number | null;
+  underlying_close: number | null;
+};
+
+/** Per-user settings; currently just the equity §7's sizing is measured against. */
+export type UserSettings = {
+  user_id: string;
+  account_equity: number | null;
+  updated_at: string | null;
 };
 
 /** Columns that accept null, and so may be omitted from an insert. */
@@ -173,6 +206,8 @@ export type Database = {
       iv_snapshots: TableFor<IvSnapshot>;
       positions: TableFor<Position, "id">;
       alerts: TableFor<Alert, "id">;
+      position_marks: TableFor<PositionMark>;
+      user_settings: TableFor<UserSettings>;
     };
     Views: Record<never, never>;
     Functions: Record<never, never>;

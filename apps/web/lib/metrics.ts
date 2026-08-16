@@ -114,6 +114,171 @@ export function positionSize(equity: number | null, mid: number | null): SizeRes
   };
 }
 
+/** One option contract covers 100 shares; every premium here is per share. */
+export const SHARES_PER_CONTRACT = 100;
+
+/**
+ * SPEC.md §7's exit thresholds, mirrored for display only.
+ *
+ * The scanner's `risk.py` is the source of truth — it is what actually fires
+ * alerts. These copies exist so the page can say *how far* a position is from a
+ * stop rather than only whether one has fired. A test parses `risk.py` and
+ * fails on divergence, so a page cannot end up drawing a stop line the scanner
+ * does not use.
+ */
+export const PREMIUM_STOP_FRACTION = 0.5;
+export const TIME_EXIT_DTE = 180;
+export const CIRCUIT_BREAKER_LOSS_FRACTION = 0.08;
+export const CIRCUIT_BREAKER_WEEKS = 4;
+export const CIRCUIT_BREAKER_DAYS = CIRCUIT_BREAKER_WEEKS * 7;
+
+type Holding = { contracts: number; entry_premium: number };
+
+/** Premium paid, in dollars. */
+export function costBasis(position: Holding): number {
+  return position.entry_premium * position.contracts * SHARES_PER_CONTRACT;
+}
+
+export type Pnl = { value: number; cost: number; dollars: number; fraction: number };
+
+/**
+ * Mark-to-market P&L against the entry premium.
+ *
+ * Null when there is no mark — the daily job has not run, or could not price
+ * this contract. An unmarked position shows an em dash, never a zero: "we do
+ * not know what this is worth" and "this is worth exactly what you paid" are
+ * very different statements to put in front of someone holding it.
+ */
+export function positionPnl(position: Holding, mid: number | null | undefined): Pnl | null {
+  if (mid === null || mid === undefined || !Number.isFinite(mid)) return null;
+
+  const cost = costBasis(position);
+  const value = mid * position.contracts * SHARES_PER_CONTRACT;
+  if (!(cost > 0)) return null;
+
+  return { value, cost, dollars: value - cost, fraction: (value - cost) / cost };
+}
+
+/** The mark at which §7's premium stop fires for a given entry. */
+export function premiumStopLevel(entryPremium: number): number {
+  return PREMIUM_STOP_FRACTION * entryPremium;
+}
+
+/** Calendar days from `from` to `to`, both ISO date strings, in UTC. */
+export function daysBetween(from: string, to: string): number {
+  const start = Date.parse(`${from}T00:00:00Z`);
+  const end = Date.parse(`${to}T00:00:00Z`);
+  return Math.round((end - start) / 86_400_000);
+}
+
+export type SectorMeter = { sector: string; count: number; over: boolean };
+
+export type SleeveMeters = {
+  /** Open premium at cost, which is what the caps are written against. */
+  openPremium: number;
+  /** Share of current equity; null until an equity figure exists. */
+  exposureFraction: number | null;
+  overExposureCap: boolean;
+  positionCount: number;
+  overPositionCap: boolean;
+  sectors: SectorMeter[];
+};
+
+/**
+ * SPEC.md §7's sleeve meters: 15% of equity in open premium, 2 per sector, 5
+ * positions.
+ *
+ * Exposure is measured at **cost**, not at current mark. The cap governs how
+ * much was committed, and a sleeve that has halved in value has not thereby
+ * earned room for another trade — marking to market would loosen the limit
+ * exactly when it should bite. (Current value is shown separately, as P&L.)
+ *
+ * These are warnings, never blocks (§7 is explicit); nothing here refuses
+ * anything, it only reports.
+ */
+export function sleeveMeters(
+  open: (Holding & { symbol: string })[],
+  sectorOf: (symbol: string) => string | null,
+  equity: number | null,
+): SleeveMeters {
+  const openPremium = open.reduce((total, position) => total + costBasis(position), 0);
+  const exposureFraction =
+    equity !== null && Number.isFinite(equity) && equity > 0 ? openPremium / equity : null;
+
+  const counts = new Map<string, number>();
+  for (const position of open) {
+    const sector = sectorOf(position.symbol) ?? "Unknown";
+    counts.set(sector, (counts.get(sector) ?? 0) + 1);
+  }
+
+  return {
+    openPremium,
+    exposureFraction,
+    overExposureCap: exposureFraction !== null && exposureFraction > SLEEVE_EXPOSURE_CAP,
+    positionCount: open.length,
+    overPositionCap: open.length > MAX_POSITIONS,
+    sectors: [...counts.entries()]
+      .map(([sector, count]) => ({ sector, count, over: count > MAX_PER_SECTOR }))
+      .sort((a, b) => b.count - a.count || a.sector.localeCompare(b.sector)),
+  };
+}
+
+/**
+ * Which of §7's caps a prospective entry would breach.
+ *
+ * Shared deliberately: the entry form shows these as warnings *before* the
+ * owner commits, and the server action recomputes them to write the override
+ * log §7 asks for. Recomputing server-side rather than trusting what the form
+ * submitted is the point — otherwise the log would record whatever the client
+ * chose to admit to.
+ *
+ * An empty list means the entry breaches nothing.
+ */
+export function capBreaches(
+  candidate: Holding & { symbol: string; sector: string | null },
+  open: (Holding & { symbol: string })[],
+  sectorOf: (symbol: string) => string | null,
+  equity: number | null,
+): string[] {
+  const breaches: string[] = [];
+  const cost = costBasis(candidate);
+
+  if (equity !== null && equity > 0) {
+    const perPosition = MAX_PREMIUM_FRACTION * equity;
+    if (cost > perPosition) {
+      breaches.push(
+        `Position premium $${Math.round(cost).toLocaleString("en-US")} exceeds the ` +
+          `${Math.round(MAX_PREMIUM_FRACTION * 100)}% per-position budget of ` +
+          `$${Math.round(perPosition).toLocaleString("en-US")}.`,
+      );
+    }
+
+    const after = open.reduce((total, position) => total + costBasis(position), 0) + cost;
+    if (after / equity > SLEEVE_EXPOSURE_CAP) {
+      breaches.push(
+        `Sleeve exposure would reach ${((after / equity) * 100).toFixed(1)}% of equity, over the ` +
+          `${Math.round(SLEEVE_EXPOSURE_CAP * 100)}% cap.`,
+      );
+    }
+  }
+
+  if (open.length + 1 > MAX_POSITIONS) {
+    breaches.push(`This would be open position ${open.length + 1}, over the ${MAX_POSITIONS} cap.`);
+  }
+
+  const sector = candidate.sector;
+  if (sector) {
+    const existing = open.filter((position) => sectorOf(position.symbol) === sector).length;
+    if (existing + 1 > MAX_PER_SECTOR) {
+      breaches.push(
+        `This would be ${existing + 1} positions in ${sector}, over the ${MAX_PER_SECTOR} cap.`,
+      );
+    }
+  }
+
+  return breaches;
+}
+
 /**
  * SPEC.md §5.1: the LEAP window is DTE ≥ 350. A shorter contract means no
  * expiry that far out existed, and the scanner fell back to the longest one —

@@ -247,6 +247,22 @@ circuit break : sleeve loss >= 8% of entry equity
           stochastic that has been sitting under 20 for six weeks is not firing an exit signal
           every week.
         </p>
+        <p>
+          Three details the formulas above leave open, resolved here rather than left to chance.
+          The circuit breaker&rsquo;s denominator is the account equity recorded against the most
+          recently opened position — a snapshot frozen at entry, so editing the current equity
+          figure cannot defuse a breaker that has already tripped. Its numerator is realised P&amp;L
+          on positions closed in the trailing four weeks plus unrealised P&amp;L on everything
+          still open. And the four-week ban runs from the day it trips: it is not lifted early by
+          the sleeve recovering.
+        </p>
+        <p>
+          Alerts do not repeat themselves into uselessness. Four of the six rules describe a state
+          that holds for as long as it holds, so a fresh alert is suppressed while an
+          unacknowledged one of the same kind is open on the same position — acknowledging it
+          re-arms the rule, because the condition is still true tomorrow. The earnings heads-up
+          fires once per report, and the circuit breaker once per four-week ban.
+        </p>
       </Section>
 
       <Section title="Data caveats">

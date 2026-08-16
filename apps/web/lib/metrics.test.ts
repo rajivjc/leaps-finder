@@ -15,10 +15,24 @@ import { describe, expect, it } from "vitest";
 
 import { EM_DASH, fmtPercent, fmtScore, fmtUsd } from "@/lib/format";
 import {
+  CIRCUIT_BREAKER_LOSS_FRACTION,
+  CIRCUIT_BREAKER_WEEKS,
   IV_PASS_MAX,
+  MAX_PER_SECTOR,
+  MAX_POSITIONS,
+  PREMIUM_STOP_FRACTION,
   QUALITY_PASS_MIN,
+  SHARES_PER_CONTRACT,
+  SLEEVE_EXPOSURE_CAP,
+  TIME_EXIT_DTE,
+  capBreaches,
+  costBasis,
   cushion,
+  daysBetween,
+  positionPnl,
   positionSize,
+  premiumStopLevel,
+  sleeveMeters,
   targetAdjusted,
 } from "@/lib/metrics";
 
@@ -157,5 +171,196 @@ describe("formatting null semantics", () => {
     expect(fmtPercent(0.0734, 1, { signed: true })).toBe("+7.3%");
     expect(fmtPercent(-0.0734, 1, { signed: true })).toBe("-7.3%");
     expect(fmtPercent(0.0734)).toBe("7.3%");
+  });
+});
+
+describe("mark-to-market P&L (SPEC §7)", () => {
+  const held = { contracts: 2, entry_premium: 10 };
+
+  it("multiplies by 100 shares a contract", () => {
+    expect(costBasis(held)).toBe(2000);
+    expect(positionPnl(held, 12)?.dollars).toBe(400);
+    expect(positionPnl(held, 6)?.dollars).toBe(-800);
+  });
+
+  it("reports the fraction against cost, not against the mark", () => {
+    expect(positionPnl(held, 5)?.fraction).toBeCloseTo(-0.5, 10);
+  });
+
+  it("returns null without a mark, so the UI can show a dash instead of a zero", () => {
+    // "We do not know what this is worth" must not render as "it is worth what
+    // you paid" — the two are very different things to tell a holder.
+    expect(positionPnl(held, null)).toBeNull();
+    expect(positionPnl(held, undefined)).toBeNull();
+    expect(positionPnl(held, Number.NaN)).toBeNull();
+  });
+
+  it("treats a worthless contract as a real mark, not a missing one", () => {
+    expect(positionPnl(held, 0)?.dollars).toBe(-2000);
+  });
+
+  it("puts the premium stop at half the entry", () => {
+    expect(premiumStopLevel(10)).toBe(5);
+  });
+});
+
+describe("sleeve meters (SPEC §7)", () => {
+  const sectors: Record<string, string> = { AAA: "Tech", BBB: "Tech", CCC: "Health Care" };
+  const sectorOf = (symbol: string) => sectors[symbol] ?? null;
+
+  const open = [
+    { symbol: "AAA", contracts: 1, entry_premium: 30 },
+    { symbol: "BBB", contracts: 2, entry_premium: 20 },
+  ];
+
+  it("measures exposure at cost against equity", () => {
+    const meters = sleeveMeters(open, sectorOf, 100_000);
+
+    expect(meters.openPremium).toBe(7000);
+    expect(meters.exposureFraction).toBeCloseTo(0.07, 10);
+    expect(meters.overExposureCap).toBe(false);
+  });
+
+  it("flags a breach of the 15% cap", () => {
+    expect(sleeveMeters(open, sectorOf, 40_000).overExposureCap).toBe(true);
+  });
+
+  it("leaves exposure unmeasured rather than assuming an equity", () => {
+    const meters = sleeveMeters(open, sectorOf, null);
+
+    expect(meters.exposureFraction).toBeNull();
+    expect(meters.overExposureCap).toBe(false);
+  });
+
+  it("counts positions per sector and flags the third in one", () => {
+    const crowded = [...open, { symbol: "AAA", contracts: 1, entry_premium: 10 }];
+    const tech = sleeveMeters(crowded, sectorOf, 100_000).sectors.find((s) => s.sector === "Tech");
+
+    expect(tech).toEqual({ sector: "Tech", count: 3, over: true });
+  });
+
+  it("files a symbol the scanner has never seen under Unknown", () => {
+    const meters = sleeveMeters([{ symbol: "ZZZ", contracts: 1, entry_premium: 1 }], sectorOf, null);
+
+    expect(meters.sectors).toEqual([{ sector: "Unknown", count: 1, over: false }]);
+  });
+});
+
+describe("cap breaches for a prospective entry (SPEC §7)", () => {
+  const sectorOf = (symbol: string) => (symbol === "CCC" ? "Health Care" : "Tech");
+  const open = [
+    { symbol: "AAA", contracts: 1, entry_premium: 30 },
+    { symbol: "BBB", contracts: 1, entry_premium: 30 },
+  ];
+
+  it("finds nothing wrong with a well-sized entry", () => {
+    const breaches = capBreaches(
+      { symbol: "CCC", sector: "Health Care", contracts: 1, entry_premium: 25 },
+      open,
+      sectorOf,
+      200_000,
+    );
+
+    expect(breaches).toEqual([]);
+  });
+
+  it("catches an oversized single position", () => {
+    const breaches = capBreaches(
+      { symbol: "CCC", sector: "Health Care", contracts: 5, entry_premium: 40 },
+      [],
+      sectorOf,
+      100_000,
+    );
+
+    expect(breaches.some((text) => text.includes("per-position budget"))).toBe(true);
+  });
+
+  it("catches a third position in the same sector", () => {
+    const breaches = capBreaches(
+      { symbol: "DDD", sector: "Tech", contracts: 1, entry_premium: 5 },
+      open,
+      sectorOf,
+      1_000_000,
+    );
+
+    expect(breaches.some((text) => text.includes("Tech"))).toBe(true);
+  });
+
+  it("catches a sixth open position", () => {
+    const five = Array.from({ length: 5 }, (_, index) => ({
+      symbol: `S${index}`,
+      contracts: 1,
+      entry_premium: 1,
+    }));
+
+    const breaches = capBreaches(
+      { symbol: "CCC", sector: "Health Care", contracts: 1, entry_premium: 1 },
+      five,
+      () => "Health Care",
+      1_000_000,
+    );
+
+    expect(breaches.some((text) => text.includes(`over the ${MAX_POSITIONS} cap`))).toBe(true);
+  });
+
+  it("checks only the count caps when no equity is known", () => {
+    // Without a denominator the dollar caps are unmeasurable; reporting them as
+    // passed would be as wrong as reporting them as breached.
+    const breaches = capBreaches(
+      { symbol: "CCC", sector: "Health Care", contracts: 100, entry_premium: 100 },
+      [],
+      sectorOf,
+      null,
+    );
+
+    expect(breaches).toEqual([]);
+  });
+});
+
+describe("daysBetween", () => {
+  it("counts calendar days in UTC", () => {
+    expect(daysBetween("2026-08-14", "2027-06-18")).toBe(308);
+    expect(daysBetween("2026-08-14", "2026-08-14")).toBe(0);
+    expect(daysBetween("2026-08-14", "2026-08-13")).toBe(-1);
+  });
+
+  it("does not drift across a DST boundary", () => {
+    // US DST ends 2026-11-01. Local-time arithmetic would make this 24 hours
+    // long and round to the wrong day.
+    expect(daysBetween("2026-10-31", "2026-11-02")).toBe(2);
+  });
+});
+
+describe("risk thresholds stay in step with the scanner", () => {
+  // `risk.py` is what actually fires alerts. These copies only let the page say
+  // how *close* a position is to a stop — but a page drawing a stop line the
+  // scanner does not use is a page that lies quietly, so drift fails a test.
+  const riskPy = readFileSync(
+    fileURLToPath(new URL("../../../scanner/leaps_scanner/risk.py", import.meta.url)),
+    "utf8",
+  );
+
+  function constantIn(name: string): number {
+    const match = riskPy.match(new RegExp(`^${name}\\s*=\\s*([0-9.]+)`, "m"));
+    if (!match) throw new Error(`${name} not found in risk.py`);
+    return Number(match[1]);
+  }
+
+  it.each([
+    ["PREMIUM_STOP_FRACTION", PREMIUM_STOP_FRACTION],
+    ["TIME_EXIT_DTE", TIME_EXIT_DTE],
+    ["CIRCUIT_BREAKER_LOSS_FRACTION", CIRCUIT_BREAKER_LOSS_FRACTION],
+    ["CIRCUIT_BREAKER_WEEKS", CIRCUIT_BREAKER_WEEKS],
+    ["SHARES_PER_CONTRACT", SHARES_PER_CONTRACT],
+  ])("matches risk.%s", (name, value) => {
+    expect(value).toBe(constantIn(name));
+  });
+});
+
+describe("sleeve caps match the spec table (SPEC §7)", () => {
+  it("pins the three sleeve limits", () => {
+    expect(SLEEVE_EXPOSURE_CAP).toBe(0.15);
+    expect(MAX_POSITIONS).toBe(5);
+    expect(MAX_PER_SECTOR).toBe(2);
   });
 });

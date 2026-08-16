@@ -32,12 +32,21 @@ time:
    — row-level security policies and grants
 3. [`supabase/migrations/0003_weekly_bars.sql`](../supabase/migrations/0003_weekly_bars.sql)
    — the weekly bar series behind the charts, with its own read policy
+4. [`supabase/migrations/0004_risk.sql`](../supabase/migrations/0004_risk.sql)
+   — the risk engine's tables: current account equity, daily marks for held contracts, and
+   alert provenance
 
 Order matters: each file references tables an earlier one creates.
 
 An existing project needs step 3 before the next scan and before deploying the web app: the
 scanner writes `weekly_bars` on every full scan, and the screener reads it for the card
 sparklines. Until the table exists, both fail loudly rather than silently drawing nothing.
+
+Step 4 is required before the daily refresh job runs and before `/positions` is reachable. It
+also changes two things that already exist, so it is worth reading before running: it adds a
+`user_id` column to `alerts` (sleeve-level alerts such as the circuit breaker belong to a user,
+not to a position, and 0002's policy reached ownership only through `position_id`), and it puts
+`on delete cascade` on the alerts → positions foreign key so a position can actually be deleted.
 
 <details>
 <summary>Using the Supabase CLI instead</summary>
@@ -89,8 +98,22 @@ up"** off.
 
 This project is designed for a single owner ([SPEC.md §0](../SPEC.md)). Doing this before you
 share the project URL anywhere means the window in which a stranger can create an account never
-opens. You will add yourself later through **Authentication → Users → Invite user** when the
-positions feature lands in M5.
+opens.
+
+Then add yourself: **Authentication → Users → Invite user**, with the address you will sign in
+with. This is the only account that will ever exist, and `/positions` is empty without it.
+
+Finally, tell Supabase where sign-in links are allowed to land — **Authentication → URL
+Configuration → Redirect URLs**:
+
+```
+http://localhost:3000/auth/callback
+https://<your-vercel-domain>/auth/callback
+```
+
+The web app builds that URL from the browser's own origin, so a link opened against an origin
+Supabase does not recognise is rejected at the auth server rather than by this app. Local dev
+must therefore be on port 3000 to match the entry above.
 
 ## 5. Collect the keys
 
@@ -196,7 +219,8 @@ Then run it the way it will actually run: repository **Actions → Weekly scan �
 ## Notes on the free tier
 
 - Projects **pause after 7 days of inactivity**. The weekly scan alone is enough to prevent
-  that; the daily refresh job in M5 makes it certain.
+  that; the daily refresh job (**Actions → Daily refresh**, weekdays at 22:30 UTC) makes it
+  certain — it writes IV snapshots on every run.
 - The row count this project generates is small — roughly 250 tickers, a few hundred scan
   results per week, and one IV snapshot per symbol per day.
 

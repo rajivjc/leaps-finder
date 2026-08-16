@@ -375,3 +375,44 @@ class TestWeeklyHistory:
 
         assert capped[-1].slow_k == pytest.approx(full[cutoff].slow_k)
         assert capped[-1].sma200 == pytest.approx(full[cutoff].sma200)
+
+
+class TestDailyTrend:
+    """§7 gives the trend break a *daily* cadence, so it reads the latest
+    session rather than the last completed week the way `evaluate` does."""
+
+    def test_it_reads_the_most_recent_session_not_the_week_close(self):
+        # A frame ending mid-week: `evaluate` would report last Friday, this
+        # reads Wednesday.
+        daily = daily_frame(400, end="2026-08-12")
+
+        assert indicators.daily_trend(daily).as_of_date == date(2026, 8, 12)
+
+    def test_a_rising_series_is_a_healthy_trend(self):
+        reading = indicators.daily_trend(daily_frame(400))
+
+        assert reading.trend_pass
+        assert not reading.trend_broken
+
+    def test_a_collapse_below_the_200_day_breaks_the_trend(self):
+        closes = list(np.linspace(100.0, 200.0, 399)) + [120.0]
+        reading = indicators.daily_trend(daily_frame(400, closes=closes))
+
+        assert reading.trend_broken
+        assert not reading.trend_pass
+        assert reading.close == pytest.approx(120.0)
+
+    def test_a_sustained_decline_puts_the_50_under_the_200(self):
+        closes = list(np.linspace(200.0, 100.0, 400))
+        reading = indicators.daily_trend(daily_frame(400, closes=closes))
+
+        assert reading.sma50 < reading.sma200
+        assert reading.trend_broken
+
+    def test_thin_history_raises_rather_than_guessing(self):
+        with pytest.raises(InsufficientHistory):
+            indicators.daily_trend(daily_frame(120))
+
+    def test_an_empty_frame_raises(self):
+        with pytest.raises(InsufficientHistory):
+            indicators.daily_trend(pd.DataFrame())

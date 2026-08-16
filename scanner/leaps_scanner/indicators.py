@@ -76,6 +76,25 @@ class Signals:
 
 
 @dataclass(frozen=True)
+class DailyTrend:
+    """§4's trend, read at the most recent daily session.
+
+    `Signals` reads the daily averages at the last *completed week* so that a
+    Saturday scan and a Tuesday rerun of the same week agree. §7 gives the
+    trend-break exit a **daily** cadence, which is the opposite requirement: it
+    has to see today's close, not last Friday's. Hence a second reading rather
+    than a reinterpretation of the first.
+    """
+
+    as_of_date: date
+    close: float
+    sma50: float
+    sma200: float
+    trend_pass: bool
+    trend_broken: bool
+
+
+@dataclass(frozen=True)
 class WeeklyBar:
     """One completed weekly bar plus the overlays the charts draw on it (§8.2)."""
 
@@ -283,6 +302,46 @@ def weekly_history(
             )
         )
     return bars
+
+
+def daily_trend(daily: pd.DataFrame) -> DailyTrend:
+    """The §4 trend filter and its exit condition at the latest daily session.
+
+    Entry and exit are deliberately *not* complements. `trend_pass` needs the
+    close above both averages with the 50 above the 200; `trend_broken` needs
+    the close below the 200 or the 50 below it. A close that has slipped under
+    the 50-day but is still well above the 200 satisfies neither — it is no
+    longer an entry and not yet an exit, and §4 leaves that band as a hold on
+    purpose. Deriving one from the other would collapse it.
+
+    The reading is taken from the last session in the frame, whatever it is. The
+    daily job runs after the US close by design, so that session is a settled
+    one; a run started mid-session marks against a bar still being written,
+    which is why every alert and mark records the session date it used.
+    """
+    if daily.empty:
+        raise InsufficientHistory("no daily bars")
+
+    daily = daily.sort_index()
+    if len(daily) < MIN_DAILY_BARS:
+        raise InsufficientHistory(f"{len(daily)} daily bars, need {MIN_DAILY_BARS}")
+
+    close_series = daily["Close"]
+    close = float(close_series.iloc[-1])
+    sma50 = float(sma(close_series, SMA_FAST).iloc[-1])
+    sma200 = float(sma(close_series, SMA_SLOW).iloc[-1])
+
+    if not all(np.isfinite([close, sma50, sma200])):
+        raise InsufficientHistory("trend inputs contain NaN")
+
+    return DailyTrend(
+        as_of_date=daily.index[-1].date(),
+        close=close,
+        sma50=sma50,
+        sma200=sma200,
+        trend_pass=bool(close > sma50 and close > sma200 and sma50 > sma200),
+        trend_broken=bool(close < sma200 or sma50 < sma200),
+    )
 
 
 def evaluate(daily: pd.DataFrame, today: date | None = None) -> Signals:

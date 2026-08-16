@@ -26,7 +26,7 @@ from datetime import date, timedelta
 
 import pandas as pd
 
-from leaps_scanner import db, fundamentals, indicators, options, prices, scoring, universe
+from leaps_scanner import db, fundamentals, indicators, options, prices, risk, scoring, universe
 from leaps_scanner.config import ConfigError, load_env_file, load_settings
 from leaps_scanner.fundamentals import Fundamentals
 from leaps_scanner.indicators import InsufficientHistory, Signals
@@ -48,7 +48,14 @@ MAX_MISSING_FRACTION = 0.20
 # headroom beyond a year or it would silently truncate the rank window.
 IV_HISTORY_DAYS = 420
 
-M3_NOTE = "M3: five filters, option economics and scoring; exit monitor lands in M5."
+# How far back the exit monitor reads alerts to decide whether a new one would
+# merely repeat an existing one. Comfortably past the longest suppression window
+# (the breaker's four weeks) because the "unacknowledged" rule has no window at
+# all — an alert left unacknowledged for months must still suppress its twin.
+# The table holds one owner's alerts, so reading a year of them is trivial.
+ALERT_HISTORY_DAYS = 365
+
+SCAN_NOTE = "Five filters, option economics, scoring, and §7's weekly exit rule."
 
 
 @dataclass(frozen=True)
@@ -269,7 +276,7 @@ def assess(
     detail = (
         f"{missing}/{universe_count} symbols without price history, "
         f"{option_failures} evaluated without option data, "
-        f"{fundamentals_failures} without fundamentals. {M3_NOTE}"
+        f"{fundamentals_failures} without fundamentals. {SCAN_NOTE}"
     )
 
     if universe_count == 0:
@@ -360,7 +367,7 @@ def run_full_scan(
     min_market_cap: float = universe.MIN_MARKET_CAP,
     sleeper=time.sleep,
 ) -> ScanReport:
-    """The weekly pipeline (SPEC.md §3, steps 1-6; the exit monitor is M5).
+    """The weekly pipeline (SPEC.md §3, steps 1-8).
 
     `sleeper` backs every throttle and backoff in the run; tests pass a no-op
     so the pipeline suite stays instant.
@@ -563,6 +570,30 @@ def _run_full_scan(
         data_failures=data_failures,
     )
 
+    # §3.7 / §7: the exit monitor. Only the weekly rule runs here — §7's other
+    # five carry a daily cadence and belong to `refresh`, which is the run that
+    # has the daily marks they need.
+    positions = open_positions(client)
+    monitor = run_exit_monitor(
+        client,
+        scan_id,
+        positions=positions,
+        as_of=as_of,
+        rules=risk.WEEKLY_RULES,
+        slow_k={
+            symbol: _slow_k_series(outcome.frames[symbol], as_of)
+            for symbol in {position.symbol for position in positions}
+            if symbol in outcome.frames
+        },
+    )
+    if monitor.gaps:
+        # A held name missing from this scan's frames leaves its weekly rule
+        # unrun; that is a coverage failure regardless of the 20% ceiling.
+        status = db.STATUS_FAILED
+        notes = f"exit evaluation incomplete — {'; '.join(monitor.gaps)}. {notes}"
+    if monitor.positions:
+        notes = f"{notes} {monitor.alerts} alert(s) from {monitor.positions} open position(s)."
+
     db.write_scan_results(client, rows)
     # The chart series behind §8.1's sparklines and §8.2's panels, from the same
     # frames the signals were read from.
@@ -599,6 +630,425 @@ def _run_full_scan(
     )
 
 
+@dataclass(frozen=True)
+class ExitMonitorReport:
+    """What the exit monitor did on one run."""
+
+    positions: int
+    alerts: int
+    # Rules that were scheduled but could not be evaluated. Never silent: a
+    # missed exit signal is worse than a missing one that is reported, so these
+    # fail the run (CLAUDE.md, and §9's rule against partial data looking whole).
+    gaps: tuple[str, ...]
+
+
+def run_exit_monitor(
+    client,
+    scan_id: int,
+    *,
+    positions: Sequence[risk.Position],
+    as_of: date,
+    rules: frozenset[str],
+    trends: Mapping[str, indicators.DailyTrend] | None = None,
+    marks: Mapping[int, risk.Mark] | None = None,
+    earnings: Mapping[str, date] | None = None,
+    slow_k: Mapping[str, pd.Series] | None = None,
+    closed_positions: Sequence[risk.Position] = (),
+    circuit_breaker: bool = False,
+) -> ExitMonitorReport:
+    """SPEC.md §3.7 / §7: evaluate exit rules for open positions and write alerts.
+
+    Shared by both entrypoints because the rules are the same rules; only §7's
+    cadence column differs, and that arrives as `rules`.
+    """
+    if not positions:
+        return ExitMonitorReport(positions=0, alerts=0, gaps=())
+
+    ledger = risk.AlertLedger(
+        risk.ExistingAlert.from_row(row)
+        for row in db.fetch_recent_alerts(client, since=as_of - timedelta(days=ALERT_HISTORY_DAYS))
+    )
+
+    alerts: list[risk.Alert] = []
+    gaps: list[str] = []
+
+    for position in positions:
+        outcome = risk.evaluate_position(
+            risk.PositionInputs(
+                position=position,
+                trend=(trends or {}).get(position.symbol),
+                mark=(marks or {}).get(position.id),
+                next_earnings=(earnings or {}).get(position.symbol),
+                slow_k=(slow_k or {}).get(position.symbol),
+            ),
+            as_of,
+            rules=rules,
+            ledger=ledger,
+        )
+        alerts.extend(outcome.alerts)
+        for kind in outcome.unevaluated:
+            detail = f"position {position.id} ({position.symbol}): {kind} not evaluated"
+            if kind in risk.BLOCKING_RULES:
+                gaps.append(detail)
+            else:
+                # Informational rules (§7's earnings heads-up) are logged but do
+                # not fail the run — see `risk.BLOCKING_RULES`.
+                logger.info("%s (informational)", detail)
+
+    if circuit_breaker:
+        for user_id in sorted({position.user_id for position in positions}):
+            mine = [position for position in positions if position.user_id == user_id]
+            closed = [position for position in closed_positions if position.user_id == user_id]
+            pnl = risk.sleeve_pnl(mine, closed, dict(marks or {}), as_of)
+
+            if pnl.equity is None:
+                gaps.append(
+                    "circuit breaker not evaluated: no open position carries "
+                    "account_equity_at_entry"
+                )
+                continue
+            if not pnl.complete:
+                # Still evaluated — an understated loss that already trips is a
+                # real trip — but the understatement is reported either way.
+                gaps.append(
+                    f"circuit breaker measured on {pnl.marked_count} of {pnl.open_count} "
+                    "open positions; unrealised P&L is understated"
+                )
+
+            alert = risk.circuit_breaker_alert(pnl, user_id, as_of)
+            if alert is not None and not ledger.suppresses(alert):
+                alerts.append(alert)
+
+    if alerts:
+        db.insert_alerts(client, [alert.to_row(scan_id) for alert in alerts])
+        for alert in alerts:
+            logger.warning("alert %s: %s", alert.kind, alert.message)
+
+    return ExitMonitorReport(positions=len(positions), alerts=len(alerts), gaps=tuple(gaps))
+
+
+def open_positions(client) -> list[risk.Position]:
+    """Every open position, as the risk rules want them."""
+    rows = db.fetch_positions(client, status=risk.STATUS_OPEN)
+    return [risk.Position.from_row(row) for row in rows]
+
+
+def resolve_session_date(frames: Mapping[str, pd.DataFrame], fallback: date) -> date:
+    """The trading day a refresh speaks for: the last session most symbols have.
+
+    The same majority rule `resolve_as_of_date` uses on weeks, for the same
+    reason — a halted or thinly-traded name can trail the market by a session,
+    and the run is labelled with the day the market had.
+    """
+    counts = Counter(frame.index[-1].date() for frame in frames.values() if not frame.empty)
+    if not counts:
+        return fallback
+    return max(counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+
+def assess_refresh(
+    universe_count: int,
+    priced_count: int,
+    iv_failures: int,
+    positions_count: int,
+    gaps: Sequence[str],
+) -> tuple[str, str]:
+    """Decide the refresh's status.
+
+    Two independent ways to fail. §9's 20% coverage ceiling applies to the
+    universe-wide half of the job (quotes and IV snapshots) exactly as it does
+    to a full scan. The exit half has a stricter rule: *any* scheduled rule
+    that could not be evaluated fails the run, without a ceiling, because the
+    population is a handful of positions the owner actually holds and one
+    unevaluated stop is one stop too many.
+    """
+    detail = (
+        f"{priced_count}/{universe_count} symbols repriced, "
+        f"{iv_failures} without an IV30 reading, "
+        f"{positions_count} open position(s) evaluated."
+    )
+
+    if universe_count == 0:
+        return db.STATUS_FAILED, "no universe to refresh; run a full scan first"
+
+    if gaps:
+        return db.STATUS_FAILED, f"exit evaluation incomplete — {'; '.join(gaps)}. {detail}"
+
+    incomplete = (universe_count - priced_count) + iv_failures
+    fraction = incomplete / universe_count
+    if fraction > MAX_MISSING_FRACTION:
+        return (
+            db.STATUS_FAILED,
+            f"{incomplete}/{universe_count} symbols ({fraction:.1%}) incomplete, over the "
+            f"{MAX_MISSING_FRACTION:.0%} ceiling. {detail}",
+        )
+
+    return db.STATUS_OK, detail
+
+
+@dataclass(frozen=True)
+class RefreshReport:
+    """What a daily refresh did, for the `scans` row and the exit code."""
+
+    as_of_date: date
+    universe_count: int
+    priced_count: int
+    iv_failures: int
+    positions_count: int
+    marks_count: int
+    alerts_count: int
+    status: str
+    notes: str
+
+    @property
+    def ok(self) -> bool:
+        return self.status == db.STATUS_OK
+
+
+def run_daily_refresh(
+    client,
+    *,
+    downloader=prices.yahoo_downloader,
+    market_cap_fetcher=universe.yahoo_market_cap,
+    expiries_fetcher=options.yahoo_expiries,
+    chain_fetcher=options.yahoo_chain,
+    sleeper=time.sleep,
+    today: date | None = None,
+) -> RefreshReport:
+    """The daily pipeline (SPEC.md §3 `refresh`).
+
+    Quotes, IV snapshots, §7's daily exit rules, and — by simply writing to the
+    database at all — the keep-alive that stops the free-tier Supabase project
+    from pausing. Explicitly no rescoring: `scan_results` belongs to the weekly
+    full scan, and a refresh that touched it would leave the screener showing
+    scores derived from a run that never evaluated the filters behind them.
+    """
+    reference = date.today() if today is None else today
+    scan_id = db.start_scan(client, "refresh", reference)
+    try:
+        return _run_daily_refresh(
+            client,
+            scan_id,
+            downloader=downloader,
+            market_cap_fetcher=market_cap_fetcher,
+            expiries_fetcher=expiries_fetcher,
+            chain_fetcher=chain_fetcher,
+            sleeper=sleeper,
+            fallback_date=reference,
+        )
+    except Exception as exc:
+        db.finish_scan(
+            client,
+            scan_id,
+            status=db.STATUS_FAILED,
+            universe_count=0,
+            matches_count=0,
+            notes=f"refresh aborted: {type(exc).__name__}: {exc}",
+        )
+        raise
+
+
+def _run_daily_refresh(
+    client,
+    scan_id: int,
+    *,
+    downloader,
+    market_cap_fetcher,
+    expiries_fetcher,
+    chain_fetcher,
+    sleeper,
+    fallback_date: date,
+) -> RefreshReport:
+    symbols = db.fetch_universe_symbols(client)
+    positions = open_positions(client)
+    logger.info("refresh: %d symbols, %d open positions", len(symbols), len(positions))
+
+    # Held names are priced even if they have since dropped out of the universe:
+    # the owner still holds the contract, so the trend rule still has to run.
+    # They are not written back to `tickers` — membership is the full scan's call.
+    held_symbols = {position.symbol for position in positions}
+    outcome = prices.fetch_daily_ohlcv(
+        sorted(set(symbols) | held_symbols), downloader=downloader, sleeper=sleeper
+    )
+    if outcome.failed:
+        logger.warning("price fetch failed for %d symbols", len(outcome.failed))
+
+    as_of = resolve_session_date(outcome.frames, fallback_date)
+    priced = [symbol for symbol in symbols if symbol in outcome.frames]
+
+    # §3 refresh: "updates `tickers` quotes". Market cap is the quote-derived
+    # field; average volume comes free from the history just fetched.
+    caps = universe.fetch_market_caps(priced, fetcher=market_cap_fetcher, sleeper=sleeper)
+    db.upsert_tickers(
+        client,
+        [
+            {
+                "symbol": symbol,
+                "market_cap": caps.get(symbol),
+                "avg_volume_30d": _avg_volume_30d(outcome.frames[symbol]),
+                "updated_at": db.now_iso(),
+            }
+            for symbol in priced
+        ],
+    )
+
+    # §3 refresh: "appends `iv_snapshots`" — the daily cadence §6's IV-rank
+    # bootstrap is defined on. No LEAP chain is fetched: nothing is rescored.
+    iv_outcome = options.fetch_iv30(
+        [
+            options.OptionQuery(symbol=symbol, spot=float(outcome.frames[symbol]["Close"].iloc[-1]))
+            for symbol in priced
+        ],
+        today=as_of,
+        expiries_fetcher=expiries_fetcher,
+        chain_fetcher=chain_fetcher,
+        sleeper=sleeper,
+    )
+    if iv_outcome.failed:
+        logger.warning("IV30 chains failed for %d symbols", len(iv_outcome.failed))
+
+    snapshots = []
+    for symbol in priced:
+        iv30 = iv_outcome.iv30.get(symbol)
+        rv20 = options.realized_vol_20d(outcome.frames[symbol]["Close"])
+        if iv30 is None and rv20 is None:
+            continue
+        snapshots.append(
+            {"symbol": symbol, "snap_date": as_of.isoformat(), "iv30": iv30, "rv20": rv20}
+        )
+    db.upsert_iv_snapshots(client, snapshots)
+
+    # §7's premium stop: price each held contract and keep the mark, so the
+    # alert that fires can name the quote it fired on.
+    quote_outcome = options.fetch_contract_quotes(
+        [
+            options.QuoteRequest(
+                key=position.id,
+                symbol=position.symbol,
+                expiry=position.expiry,
+                strike=position.strike,
+            )
+            for position in positions
+        ],
+        chain_fetcher=chain_fetcher,
+        sleeper=sleeper,
+    )
+    marks = {
+        position.id: risk.Mark(
+            position_id=position.id,
+            mark_date=as_of,
+            bid=quote.bid,
+            ask=quote.ask,
+            mid=quote.mid,
+            underlying_close=_last_close(outcome.frames.get(position.symbol)),
+        )
+        for position in positions
+        if (quote := quote_outcome.quotes.get(position.id)) is not None
+    }
+    db.upsert_position_marks(
+        client,
+        [
+            {
+                "position_id": mark.position_id,
+                "mark_date": mark.mark_date.isoformat(),
+                "scan_id": scan_id,
+                "bid": mark.bid,
+                "ask": mark.ask,
+                "mid": mark.mid,
+                "underlying_close": mark.underlying_close,
+            }
+            for mark in marks.values()
+        ],
+    )
+
+    trends: dict[str, indicators.DailyTrend] = {}
+    for symbol in sorted(held_symbols):
+        frame = outcome.frames.get(symbol)
+        if frame is None:
+            continue
+        try:
+            trends[symbol] = indicators.daily_trend(frame)
+        except InsufficientHistory as exc:
+            logger.warning("no daily trend for %s: %s", symbol, exc)
+
+    closed = [
+        risk.Position.from_row(row) for row in db.fetch_positions(client, status=risk.STATUS_CLOSED)
+    ]
+
+    monitor = run_exit_monitor(
+        client,
+        scan_id,
+        positions=positions,
+        as_of=as_of,
+        rules=risk.DAILY_RULES,
+        trends=trends,
+        marks=marks,
+        earnings=db.fetch_latest_earnings(client),
+        closed_positions=closed,
+        circuit_breaker=True,
+    )
+
+    status, notes = assess_refresh(
+        len(symbols), len(priced), len(iv_outcome.failed), len(positions), monitor.gaps
+    )
+    notes = f"{notes} {monitor.alerts} alert(s) written."
+
+    db.finish_scan(
+        client,
+        scan_id,
+        status=status,
+        universe_count=len(symbols),
+        # A refresh screens nothing — it does not evaluate the filters at all —
+        # so the screener's match count would be a fabrication here. The alert
+        # count lives in the notes instead of borrowing a column that means
+        # something else on every other row.
+        matches_count=0,
+        notes=notes,
+        as_of_date=as_of,
+    )
+
+    return RefreshReport(
+        as_of_date=as_of,
+        universe_count=len(symbols),
+        priced_count=len(priced),
+        iv_failures=len(iv_outcome.failed),
+        positions_count=len(positions),
+        marks_count=len(marks),
+        alerts_count=monitor.alerts,
+        status=status,
+        notes=notes,
+    )
+
+
+def _slow_k_series(frame: pd.DataFrame, as_of: date) -> pd.Series:
+    """The weekly slow %K series §7's stochastic exit is read from.
+
+    Built through `indicators.weekly_history` with the same `through=as_of` cap
+    the persisted chart series uses, so the crossing an alert reports is exactly
+    the crossing the ticker page draws — the alert and its evidence come from
+    one series, not two.
+    """
+    bars = indicators.weekly_history(frame, through=as_of)
+    return pd.Series(
+        [bar.slow_k for bar in bars],
+        index=pd.to_datetime([bar.week_ending for bar in bars]),
+        dtype="float64",
+    )
+
+
+def _avg_volume_30d(frame: pd.DataFrame) -> float | None:
+    if frame.empty or "Volume" not in frame:
+        return None
+    value = float(frame["Volume"].tail(30).mean())
+    return value if pd.notna(value) else None
+
+
+def _last_close(frame: pd.DataFrame | None) -> float | None:
+    if frame is None or frame.empty:
+        return None
+    return float(frame["Close"].iloc[-1])
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_scan",
@@ -633,7 +1083,22 @@ def full_scan() -> int:
 
 def daily_refresh() -> int:
     """Daily refresh: quotes, IV snapshot, daily exit rules. No rescoring."""
-    raise NotImplementedError("daily_refresh lands in M5 (risk engine + daily job)")
+    client = db.service_client()
+    report = run_daily_refresh(client)
+
+    logger.info(
+        "refresh %s: %d/%d repriced, %d marks, %d alerts, as of %s",
+        report.status,
+        report.priced_count,
+        report.universe_count,
+        report.marks_count,
+        report.alerts_count,
+        report.as_of_date,
+    )
+    if not report.ok:
+        print(f"error: refresh recorded as {report.status} — {report.notes}", file=sys.stderr)
+        return 1
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
