@@ -21,7 +21,7 @@ Personal project for RC. Public portfolio repo. Not financial advice; the app mu
 | Universe | US-listed common stocks, market cap ≥ $50B, optionable (~250 names) |
 | Auth | Supabase Auth (magic link). Single allow-listed email (owner) can write positions; scan results publicly readable |
 | Scope v1 | Screener + LEAP economics + score + positions/exit monitor + size calculator |
-| Deferred | Backtesting (v1.5), email alerts, multi-user |
+| Deferred | Backtesting — now v2, spec'd in SPEC-BACKTEST.md (§12); email alerts; multi-user |
 
 ---
 
@@ -273,7 +273,8 @@ open premium / equity vs the 15% cap, per-sector counts vs the 2-per-sector cap,
 | Earnings heads-up | earnings within 21d (informational) | daily |
 | Circuit breaker | realized+unrealized sleeve loss ≥ 8% of entry equity → banner "no new entries 4 weeks" | daily |
 
-Alerts are rows in `alerts`, surfaced as a banner + list in the UI. (Email via Resend = v1.5.)
+Alerts are rows in `alerts`, surfaced as a banner + list in the UI. (Email via Resend:
+still parked — see §12.)
 
 ---
 

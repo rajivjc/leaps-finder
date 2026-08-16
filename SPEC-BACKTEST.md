@@ -1,7 +1,8 @@
 # LEAPS Finder — Backtest Specification (v2)
 
 A historical evaluation of the stock-level entry/exit signal over 10 years of daily data,
-with an approximate synthetic-LEAP P&L overlay and a simulation of §7's sleeve discipline.
+with an approximate synthetic-LEAP P&L overlay and a simulation of SPEC.md §7's sleeve
+discipline.
 Reports CAGR, max drawdown, win rate, and comparisons against buy-and-hold.
 
 This document is the source of truth for v2, with the same authority CLAUDE.md grants
@@ -26,27 +27,27 @@ larger fake one.
 | 3 | Survivorship | **Point-in-time S&P 500 membership** from a public change-history dataset checked into the repo. Unfetchable delisted names are logged and counted; the coverage gap is reported as residual bias. |
 | 4 | Option layer | **Stock-level signal is the headline result.** The synthetic-LEAP overlay is a clearly-labeled approximation layer — synthesized 0.70Δ strike, no liquidity gates, not comparable to the live screener. |
 | 5 | Repricing σ | **σ = trailing 252-session realized vol at entry × 1.1**, held flat for the trade's life. Sensitivity runs at 1.0× and 1.2×. |
-| 6 | Sleeve | **Per-trade statistics primary; sleeve simulation secondary**, with §7's full discipline (3% sizing, caps, circuit breaker) and a pinned tie-break rule. |
-| 7 | Benchmark | **Both**: SPY total-return buy-and-hold, and equal-weight buy-and-hold of the same entered names over the same windows. |
+| 6 | Sleeve | **Per-trade statistics primary; sleeve simulation secondary**, with SPEC.md §7's full discipline (3% sizing, caps, circuit breaker) and a pinned tie-break rule. |
+| 7 | Benchmark | **Both**: SPY total-return buy-and-hold, and equal-weight buy-and-hold of the entered names over the **full evaluation window** (amended in review 2026-08-16: the originally-worded same-trade-window hold is arithmetically the stock track itself — see §6.3.2). |
 | 8 | Spec home | **This document** (`SPEC-BACKTEST.md`, repo root). SPEC.md §12 points here; the v1 spec otherwise stays frozen. |
 
-### 0.1 Decisions proposed in this draft (not covered by the eight questions — approve or amend)
+### 0.1 Draft-pinned decisions (approved by RC with the spec, 2026-08-16)
 
 | # | Choice | Pinned as |
 |---|---|---|
 | P1 | Execution timing | Signals at close → fills at **next session's open** (§4.3). |
 | P2 | Price basis | `auto_adjust=False` raw Close/Open — **identical to the live scanner** (`prices.py`), split-adjusted, dividend-unadjusted. Benchmarks use Adj Close (total return) where stated. |
-| P3 | Synthetic tenor | Fixed **T₀ = 365 calendar days** at entry; time exit at DTE < 180 ⇒ max hold 185 days. |
+| P3 | Synthetic tenor | Fixed **T₀ = 365 calendar days** at entry; time exit at DTE < 180, which first triggers at 186 days held (fill at next open). |
 | P4 | Strike | Exact closed-form 0.70Δ strike (§5.2), no strike grid. |
 | P5 | Friction | Fill haircut **h = 0.04** of model value each way (half the Balanced preset's 8% spread cap). Sensitivity at 0 and 0.06. |
 | P6 | Dividend yield q | Trailing 365-day cash dividends ÷ entry spot, held flat (mirrors §5's q). |
 | P7 | Rate r | ^IRX/100 on the entry date, held flat for the trade. |
 | P8 | Trade granularity | One open simulated trade per symbol per track; re-entry only after exit. |
-| P9 | Sleeve notional | E₀ = $100,000; integer contracts; cash earns 0%. Sensitivity at E₀ = $250,000. |
-| P10 | Tie-break | When entry signals exceed open sleeve slots: ascending `|slowK − 35|` (the §6 Entry-subscore sweet spot), then alphabetical. Deterministic. |
-| P11 | Circuit breaker semantics | Mirror the v1 implementation in `risk.py`: trailing-28-day realized + current unrealized P&L, denominator = equity snapshot at the most recent entry, trips at ≥ 8%, latches 28 days. |
-| P12 | Where results live | Committed report under `docs/backtest/<run-date>/` (`report.md`, `results.json`, SVG equity curves) + a `/backtest` web page rendering the JSON. Manual local runs only — no cron. |
-| P13 | Entry zone | Primary entry uses the §4 base stochastic (20–70 + turning up). The Strict zone (20–55) is reported as a variant, not the headline. |
+| P9 | Sleeve notional | E₀ = $100,000; integer contracts; cash earns 0%. Sensitivity at E₀ = $250,000 (base (m, h) only; rendered in the report's sleeve section). |
+| P10 | Tie-break | When entry signals exceed open sleeve slots: ascending `abs(slowK − 35)` — 35 is the midpoint of SPEC.md §6's 25–45 Entry plateau, an arbitrary-but-pinned point preference for determinism, **not** a §6 derivation (inside the plateau §6 scores all values identically) — then alphabetical. |
+| P11 | Circuit breaker semantics | Pinned once, normatively, in §6.2. P&L arithmetic follows `risk.py`; the hard entry ban is a deliberate hardening of v1's advisory banner. |
+| P12 | Where results live | Committed report under `docs/backtest/<run-date>/` (`report.md`, `results.json`, SVG equity curves for the report) + a `/backtest` web page rendering the JSON with lightweight-charts. Manual local runs only — no cron. |
+| P13 | Entry zone | Primary entry uses the SPEC.md §4 base stochastic (20–70 + turning up). The Strict zone (20–55) is reported as a variant — Track A, base parameters only — not the headline. |
 
 ---
 
@@ -65,7 +66,8 @@ when expressed through a ~1-year 0.70Δ call under stated assumptions.
 Therefore: **a good backtest result validates the timing component only.** It is evidence
 about two of the five filters. The live strategy could still underperform (bad fundamental
 filters, unmodeled IV crush) or outperform (the untested filters may add value). The report
-and the `/backtest` page must carry this paragraph's substance verbatim as a banner.
+and the `/backtest` page must carry this section's text, word for word, as a banner —
+the exact string travels as the required `banner` field of `results.json` (§8).
 
 ---
 
@@ -87,7 +89,9 @@ and the `/backtest` page must carry this paragraph's substance verbatim as a ban
    member-week is *covered* if OHLCV exists for that week while the symbol was a member.
    The report must state: coverage ratio (covered member-weeks ÷ total member-weeks),
    count of members with no data at all, and the list of uncovered symbols with their
-   membership spans. **No coverage threshold is faked**: if coverage < 85%, every headline
+   membership spans. **No coverage threshold is faked**: below 80%
+   coverage the run reports status `failed` and commits no report — the same
+   partial-data rule as SPEC.md §9's >20%-failure trip; from 80% to 85%, every headline
    table carries an explicit low-coverage warning.
 5. **Delisting mid-trade.** If a simulated position's price history ends (acquisition,
    bankruptcy, delisting), the trade is force-exited at the last available close,
@@ -101,15 +105,25 @@ and the `/backtest` page must carry this paragraph's substance verbatim as a ban
 ## 3. Data
 
 1. **Window.** Evaluation window = the 10 years ending at the last completed `W-FRI` week
-   before the run date. Fetch extends ~18 months earlier so SMA200, RV252, and the weekly
-   stochastic are fully warmed up at the first evaluation date. A symbol becomes eligible
-   on the first date all three are defined.
+   before the run date. Fetch starts exactly **550 calendar days** before the window
+   start, so SMA200, RV252, and the weekly stochastic are fully warmed up at the first
+   evaluation date — the offset is pinned, not approximate, because cache contents feed
+   §10.1's determinism. A symbol becomes eligible on the first date all three are
+   defined.
 2. **Prices.** Daily OHLCV via yfinance with `auto_adjust=False` — the same basis as the
    live scanner (`prices.py`). `Close`/`Open` are split-adjusted, dividend-unadjusted.
    `Adj Close` is also retained, used *only* for total-return benchmarks (§6.3).
-3. **Fetch discipline.** Identical to SPEC.md §9: batched downloads, ≤ 5 req/s,
+3. **Fetch discipline.** SPEC.md §9's rules carry over: batched downloads, throttling at
+   **batch granularity exactly as v1 enforces it** (`prices.py`'s `Throttle` spaces batch
+   calls; yfinance's per-symbol requests inside a batch are not individually spaced),
    exponential backoff with jitter, 3 retries, empty-DataFrame treated as failure
-   (yfinance fails silently). Reuses the `prices.py` downloader machinery.
+   (yfinance fails silently). B1 **extends** the `prices.py` machinery rather than
+   reusing it verbatim — the extension must add start/end-dated fetches (no yfinance
+   `period` string expresses ~11.5y), fetch dividends inside the same batched calls
+   (`actions=True`), and retain `Adj Close` (the v1 `OHLCV_COLUMNS` filter would
+   silently drop the column §6.3's benchmarks need). The cold first fetch is
+   network-bound — expect roughly 30–45 minutes at the pinned throttle; the §10.5
+   runtime bound applies to warm-cache runs only.
 4. **Cache.** Fetched data is cached locally (Parquet, in a git-ignored directory).
    All computation runs from the cache; a run records the cache snapshot date. Raw price
    data is never committed (size; Yahoo terms).
@@ -126,10 +140,13 @@ and the `/backtest` page must carry this paragraph's substance verbatim as a ban
 ### 4.1 Indicators — reuse, don't reimplement
 
 SMA50/SMA200, `W-FRI` weekly resampling with the in-progress week dropped, and the
-(10, 3, 3) weekly slow stochastic are computed by importing the existing
-`leaps_scanner.indicators` functions. The backtest must not contain a second
-implementation of any §4 formula. (Acceptance §10.7 asserts parity against live
-`scan_results` rows.)
+(10, 3, 3) weekly slow stochastic are defined by the existing
+`leaps_scanner.indicators` functions, which remain the **reference implementation**.
+Those functions evaluate only the latest bar, so the 10-year event loop may implement
+vectorized equivalents — but every vectorized path must be proven equal to the
+`indicators.py` output on shared fixtures by §9's parity tests, run over the same
+cached input series (code-path parity, not data parity). No SPEC.md §4 formula is ever
+restated from this document alone. (Acceptance §10.7.)
 
 ### 4.2 Entry
 
@@ -149,10 +166,13 @@ The IV-rank, earnings-distance, quality, and liquidity preset gates are **not** 
 
 ### 4.3 Execution
 
-Signal at close of *t* → fill at the **open of the next session** with data for that
-symbol. If no bar appears within 5 sessions, the entry is skipped and logged. The same
-next-open rule applies to every exit. No same-close fills (that would use the closing
-price that produced the signal).
+**Fill rule (general, both tracks, entries and exits):** a signal at the close of *t*
+fills at the open of that symbol's next available bar. If no subsequent bar exists
+(delisting) or the evaluation window ends first, the fill is the last available close and
+the exit reason records it (`delisted`, `end_of_window`). Entries only: if no bar appears
+within 5 NYSE trading days, the entry is skipped and logged — a longer halt is itself
+information. No same-close fills (that would use the closing price that produced the
+signal).
 
 ### 4.4 Exits
 
@@ -163,7 +183,7 @@ Evaluated per SPEC.md §7, restricted to what is reconstructable:
 | Trend break | daily close < SMA200 OR SMA50 < SMA200 | daily | both tracks |
 | Stochastic | weekly slowK **crosses** below 20: `slowK[−1] ≥ 20 AND slowK < 20` (completed bar) | weekly | both tracks |
 | Premium stop | model mid ≤ 50% of entry premium paid (§5.4) | daily | LEAP overlay only |
-| Time exit | DTE < 180, i.e. calendar days held ≥ 185 (P3) | daily | both tracks |
+| Time exit | DTE < 180 ⟺ calendar days held ≥ 186 (P3; strict `<`, matching `risk.py`) | daily | both tracks |
 | Delisted | price history ends mid-trade | — | both tracks (§2.5) |
 
 Not simulated (stated, bias register): earnings heads-up (informational only in v1, and no
@@ -177,21 +197,24 @@ Trades still open at the end of the window are marked at the final close, flagge
 
 ### 4.5 Stock-track P&L
 
-`r_trade = exit_open / entry_open − 1` on the P2 price basis (dividends excluded — the
-strategy's actual vehicle is a call, which collects no dividends; direction stated in
-the bias register).
+`r_trade = exit_fill / entry_fill − 1` on the P2 price basis, with fills per §4.3's
+general rule (next open normally; last available close for `delisted` / `end_of_window`).
+Dividends excluded — the strategy's actual vehicle is a call, which collects no
+dividends; direction stated in the bias register.
 
 ---
 
 ## 5. Synthetic LEAP overlay (exact)
 
-All Black-Scholes terms as in SPEC.md §5: `d1 = (ln(S/K) + (r − q + σ²/2)T) / (σ√T)`,
-`d2 = d1 − σ√T`, call price `C = S·e^(−qT)·N(d1) − K·e^(−rT)·N(d2)`,
-`delta = e^(−qT)·N(d1)`.
+`d1 = (ln(S/K) + (r − q + σ²/2)T) / (σ√T)` and `delta = e^(−qT)·N(d1)` are SPEC.md §5's
+pinned forms. SPEC.md pins no option *price*, so this document is the authority for the
+rest: `d2 = d1 − σ√T`, call price `C = S·e^(−qT)·N(d1) − K·e^(−rT)·N(d2)`.
 
 1. **Inputs at entry** (fill date, §4.3, S = fill open):
    - `σ = m · RV252`, base multiplier `m = 1.1`; `RV252 = stdev(ln(C_i/C_{i−1}),
-     last 252 sessions, sample stdev) · √252` on the P2 close series.
+     last 252 sessions, sample stdev) · √252` on the P2 close series — implemented by
+     window-parameterizing `options.py`'s `realized_vol_20d` (the identical computation
+     at a 252-session window), not by a second routine.
    - `r` = ^IRX/100 on the entry date (last available print), held flat (P7).
    - `q` = trailing 365-day cash dividends per share ÷ S, held flat (P6). Correct on this
      price basis: dividends are *not* embedded in the P2 series, matching live §5.
@@ -201,15 +224,23 @@ All Black-Scholes terms as in SPEC.md §5: `d1 = (ln(S/K) + (r − q + σ²/2)T)
    d1* = N⁻¹(0.70 · e^(qT₀))
    K   = S · exp(−(d1*·σ√T₀ − (r − q + σ²/2)·T₀))
    ```
-   No rounding to a strike grid (P4).
+   No rounding to a strike grid (P4). **Domain guard:** if `0.70 · e^(qT₀) ≥ 1`
+   (q ≥ ln(1/0.70) ≈ 35.7%, where no strike can reach 0.70Δ), the overlay trade is
+   skipped, logged, and counted in the report; the stock-track trade proceeds
+   unaffected.
 3. **Entry premium.** `entry_cost = C(S, K, σ, r, q, T₀) · (1 + h)`, `h = 0.04` (P5).
 4. **Daily repricing.** At each daily close: `mid_t = C(S_t, K, σ, r, q, T_t)` with the
    entry σ, r, q held flat and `T_t = (expiry − t)/365`. Premium stop: `mid_t ≤ 0.5 ·
-   entry_cost` (model mid vs. premium paid, mirroring §7's live comparison).
+   entry_cost` (model mid vs. premium paid, mirroring SPEC.md §7's live comparison).
 5. **Exit value.** `exit_value = C(S_exit, K, σ, r, q, T_exit) · (1 − h)` at the exit
    fill (next open). Trade return `= exit_value / entry_cost − 1`.
 6. **Sensitivities.** One-at-a-time around the base case (m = 1.1, h = 0.04):
-   `m ∈ {1.0, 1.1, 1.2}` and `h ∈ {0, 0.04, 0.06}`. All five runs appear in every report.
+   `m ∈ {1.0, 1.1, 1.2}` and `h ∈ {0, 0.04, 0.06}`. All five configurations appear in
+   every report. Scope: m and h touch only this section's synthetic layer — signals,
+   the stock track, and Track A's stock statistics are computed **once** and shared
+   across every configuration, never recomputed. The sleeve (§6.2) runs at base (m, h)
+   only, once per E₀ (P9). The Strict-zone variant (P13) is Track A at base parameters
+   only.
 
 ---
 
@@ -222,16 +253,19 @@ and the LEAP overlay: trade count, win rate, mean and median return, profit fact
 return percentiles (5/25/50/75/95), holding-period stats, exit-reason breakdown
 (including `delisted` and `end_of_window` counts), and per-year trade counts.
 
-Per-trade benchmark deltas, same window and same price basis as the trade:
-- **Timing alpha:** `r_trade − r_hold`, where `r_hold` is the same symbol held
-  entry-fill → exit-fill.
+Per-trade benchmark deltas, same price basis as the trade:
+- **Vehicle alpha (LEAP overlay only):** `r_overlay − r_hold`, where `r_hold` is the same
+  symbol held entry-fill → exit-fill — what the option vehicle added or cost versus
+  owning the shares over the identical window. No stock-track alpha is reported: the
+  stock track's `r_trade` *is* the same-window hold, so that difference is zero by
+  construction.
 - **Market delta:** `r_trade − r_SPY` over the same window (SPY on the P2 basis for
   consistency at trade level).
 
 ### 6.2 Track B — sleeve simulation (secondary)
 
-Applies §7's discipline to Track A's LEAP-overlay signals, processed weekly in signal
-order (P10 tie-break):
+Applies SPEC.md §7's discipline to Track A's LEAP-overlay signals, processed weekly in
+signal order (P10 tie-break):
 
 - Start equity E₀ = $100,000 (P9); equity marks daily from model mids.
 - Per-position premium budget `0.03 · current equity`;
@@ -240,9 +274,17 @@ order (P10 tie-break):
   by the E₀ = $250k sensitivity).
 - Caps, checked at entry: ≤ 5 open positions; ≤ 2 per sector (§3.6 labels);
   open premium at cost ≤ 15% of current equity.
-- **Circuit breaker (P11, mirroring `risk.py`):** realized P&L over the trailing 28 days
-  plus unrealized on open positions, divided by the `account_equity_at_entry` snapshot of
-  the most recently opened position; at ≥ 8% loss, no new entries for 28 days (latched).
+- **Circuit breaker (P11 — this paragraph is normative):** realized P&L over the trailing
+  28 days plus unrealized on open positions, divided by the equity snapshot taken at the
+  most recent entry among open positions **and positions closed within those 28 days**
+  (so a fully stopped-out sleeve still has a denominator — `risk.py`'s `breaker_equity`
+  semantics); at ≥ 8% loss, no new entries for the next 28 days, the window restarting on
+  any later trip. Two deliberate departures from v1, stated rather than hidden: live,
+  SPEC.md §7's ban is an advisory banner ("warnings, not hard blocks") — a simulation
+  cannot model an override decision, so the ban is enforced; and the entry block itself
+  is new (live `risk.py` latching governs alert re-firing, not entries). `risk.py` is the
+  reference for the P&L arithmetic; if it and this paragraph ever disagree, the
+  divergence is a spec question to raise, not to silently follow either way.
 - Cash earns 0% (conservative; understates the sleeve — bias register).
 
 Reported: CAGR, max drawdown (daily equity), calendar-year returns, win rate, average
@@ -255,9 +297,12 @@ exposure, granularity, breaker), breaker activation dates.
    The report must state the exposure caveat: the sleeve risks ≤ 15% of equity by design
    while SPY is 100% invested — headline CAGRs are not like-for-like, and the comparison
    table says so in its caption.
-2. **Equal-weight matched names**: buy-and-hold of the distinct entered symbols,
-   equal-weighted, each over the window it was actually traded (aggregate of §6.1's
-   `r_hold`). Answers "does the timing add anything beyond the names themselves?"
+2. **Equal-weight matched names**: buy-and-hold of the distinct entered symbols over the
+   **full evaluation window** (first eligible date → window end, P2 basis; a symbol
+   delisting mid-window holds to its last close and then sits in cash), equal-weighted.
+   Answers "does the timing add anything beyond the names themselves?" — which a
+   same-trade-window hold cannot, since that quantity is arithmetically the stock track
+   itself. (Amends Decision 7's original wording; noted in §0.)
 
 ---
 
@@ -278,7 +323,7 @@ Every report embeds this table (values updated per run where applicable).
 | 9 | Earnings-distance gate not simulated | Unknown (backtest enters where live Strict/Balanced would wait) | Stated |
 | 10 | Stock-track returns exclude dividends | **Hurts** the stock track slightly vs. total-return intuition | Vehicle is a call; benchmarks labeled |
 | 11 | Cash earns 0% in the sleeve | **Hurts** the sleeve | Conservative by construction |
-| 12 | Quality/valuation/IV filters untested | Unknown — live strategy may differ in either direction | §1 banner, verbatim |
+| 12 | Quality/valuation/IV filters untested | Unknown — live strategy may differ in either direction | §1 banner (§8's `banner` field) |
 
 ---
 
@@ -288,22 +333,28 @@ Every report embeds this table (values updated per run where applicable).
 scanner/leaps_scanner/backtest/
 ├── data/sp500_membership.csv   # PIT membership (committed)
 ├── membership.py               # §2 loader + normalization
-├── data.py                     # cached 10y fetch (reuses prices.py machinery)
+├── data.py                     # cached 10y fetch (extends prices.py machinery per §3.3)
 ├── engine.py                   # §4 event loop (stock track)
-├── synthetic.py                # §5 pricing/strike (reuses options.py BS helpers)
-├── sleeve.py                   # §6.2 (mirrors risk.py breaker semantics)
+├── synthetic.py                # §5 pricing/strike — extends options.py: the call price
+│                               #   and inverse normal CDF are ADDED there beside
+│                               #   norm_cdf/bs_delta (v1 has delta only), then imported
+├── sleeve.py                   # §6.2 (breaker per §6.2 — normative in this spec)
 └── report.py                   # report.md + results.json + SVG curves
 ```
 
-- **Run:** manual only — `make backtest` / `python -m leaps_scanner.backtest`. No cron,
+- **Run:** manual only — `make backtest` (target added in B1) /
+  `python -m leaps_scanner.backtest`. No cron,
   no GitHub Actions job; it is an analysis, not a pipeline. Deterministic: no randomness,
   no wall-clock dependence beyond the recorded run date.
 - **Results:** committed via PR under `docs/backtest/<run-date>/` — `report.md` (human
   report: §1 banner, all §6 tables, §7 register, §5.6 sensitivities), `results.json`
   (machine-readable, schema versioned), equity-curve SVGs.
 - **Web:** `/backtest` page (server component) renders the latest committed
-  `results.json` at build time. The §1 banner is part of the JSON and the page must not
-  render metrics without it. No new Supabase tables, no migrations.
+  `results.json` at build time; equity curves are charted from the JSON with
+  lightweight-charts (the repo's chart convention — the committed SVGs serve `report.md`
+  only). The §1 banner text is the JSON's required top-level `banner` field; the build
+  **fails** if it is absent or empty, so the page cannot render metrics without it.
+  No new Supabase tables, no migrations.
 - **Public repo:** unchanged rules — no secrets; no raw price data committed.
 
 ---
@@ -314,7 +365,11 @@ scanner/leaps_scanner/backtest/
   - Membership boundary semantics (inclusive `added`, exclusive `removed`); symbol
     normalization; rename handling.
   - Strike inversion round-trip: `delta(K) = 0.70 ± 1e−9` for the §5.2 closed form.
-  - Repricing against §10's BS reference values; RV252 against a hand-computed fixture.
+  - Deltas against SPEC.md §10's reference values; call prices against published
+    Black-Scholes references (SPEC.md's references cover delta only, so price references
+    are added here); `N⁻¹` round-trip (`norm_cdf(inv_norm_cdf(p)) = p ± 1e−9`); the §5.2
+    domain guard (q above ≈ 35.7% skips and counts); RV252 against a hand-computed
+    fixture.
   - Friction arithmetic (entry ×1.04, exit ×0.96) to the cent.
   - Exit crossing semantics reuse the existing §10 tests (crosses-below ≠ is-below);
     exit priority ordering; forced `delisted` exit; `end_of_window` marking.
@@ -337,28 +392,38 @@ scanner/leaps_scanner/backtest/
    every headline table. No silent truncation of the universe.
 3. **Golden trade:** the §9 hand-computed trade reproduces to the cent.
 4. **No-look-ahead:** the §9 property test passes.
-5. **Runtime:** full 10y run from a warm cache < 15 min on a laptop; the initial fetch
-   respects the §3.3 throttle (≤ 5 req/s) end to end.
+5. **Runtime:** full report generation — all five §5.6 configurations, both P9 sleeves,
+   and the P13 variant, sharing one signal/stock-track computation per §5.6's scope
+   rule — completes < 15 min from a warm cache on a laptop. The initial cold fetch is
+   network-bound (roughly 30–45 min expected), excluded from the bound, and must respect
+   the §3.3 throttle at batch granularity as v1 enforces it.
 6. **Report completeness:** every generated report contains the §1 banner, the §7 bias
    register, and the §5.6 sensitivity table; the `/backtest` page renders the banner
    above any metric.
-7. **Live parity:** for a recent scan date, the backtest's `trend_pass`, `slowK`, `D`,
-   and `turning_up` for a sampled symbol equal the live `scan_results` row (same
-   `indicators.py` code path, proven, not assumed).
+7. **Code-path parity:** the engine's vectorized signal path, run over a fixture series,
+   reproduces `indicators.evaluate`'s `trend_pass`, `stoch_k`, `stoch_d`, and
+   `turning_up` exactly (§4.1 — proven, not assumed). Secondary sanity check, not a
+   gate: the same comparison against a recent live `scan_results` row using the backtest
+   cache; a mismatch there is investigated and documented, since it can reflect upstream
+   data revisions between the two fetch dates rather than a code defect.
 
 ## 11. Milestones (one Claude Code session each; branch → PR → /code-review → fix → merge)
 
-1. **B1 Universe & data:** membership CSV + loader + normalization, cached 10y fetch
-   reusing `prices.py` machinery, ^IRX + dividend series, coverage report, warm-up
-   eligibility; unit tests (membership boundaries, cache determinism).
+1. **B1 Universe & data:** membership CSV + loader + normalization; `prices.py`
+   machinery extended per §3.3 (start/end fetches, `actions=True`, `Adj Close`
+   retained); cached 10y fetch, ^IRX + dividend series, coverage report with the §2.4
+   failure floor, warm-up eligibility, `make backtest` target; unit tests (membership
+   boundaries, cache determinism).
 2. **B2 Stock-signal engine:** §4 event loop reusing `indicators.py`, Track A stock-track
    stats + per-trade benchmarks, Strict-zone variant, no-look-ahead property test,
    integration golden file. Acceptance 1, 2, 4, 7.
 3. **B3 Synthetic LEAP overlay:** §5 pricing, strike closed form, friction, premium stop,
    sensitivity grid, golden trade to the cent. Acceptance 3.
-4. **B4 Sleeve & publication:** §6.2 simulation with `risk.py`-mirrored breaker,
-   `report.md`/`results.json`/SVG generation, `/backtest` page with banner, README
-   section, first committed run under `docs/backtest/`. Acceptance 5, 6.
+4. **B4 Sleeve & publication:** §6.2 simulation (breaker per §6.2, P10 tie-break),
+   `report.md`/`results.json`/SVG generation, `/backtest` page with banner
+   (lightweight-charts), README section, first committed run under `docs/backtest/`;
+   unit tests (tie-break determinism, sleeve breaker fixture including the
+   all-positions-closed case, banner-missing build failure). Acceptance 5, 6.
 
 ## 12. Out of scope for v2
 
