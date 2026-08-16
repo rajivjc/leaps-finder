@@ -348,12 +348,11 @@ no score-inflating visual tricks (no green-at-70 thresholds; neutral color below
 6. **M6 Polish:** README with architecture diagram + screenshots, Vercel deploy, disclaimers,
    Actions badges.
 
-## 12. v1.5 (parked)
+## 12. Post-v1 scope
 
-Backtest of the stock-level signal (entry: 5 filters minus IV; exit: §7 rules) over 10y of
-daily data, with approximate LEAP P&L via BS repricing under flat-IV assumption; report CAGR,
-max DD, win rate, vs buy-and-hold. Email alerts via Resend. IV-rank graduation once 252
-snapshots accumulate.
+Backtesting is specified as **v2** in [SPEC-BACKTEST.md](SPEC-BACKTEST.md) (its own
+source-of-truth document; decisions locked 2026-08-16). Still parked: email alerts via
+Resend; IV-rank graduation once 252 snapshots accumulate.
 
 ---
 
