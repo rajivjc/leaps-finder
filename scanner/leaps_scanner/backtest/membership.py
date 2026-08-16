@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import csv
 from collections.abc import Iterable, Iterator, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from importlib import resources
 from pathlib import Path
@@ -84,32 +84,6 @@ class Membership:
     """Every membership span, indexed for point-in-time questions."""
 
     spans: tuple[MembershipSpan, ...]
-    # Derived in `__post_init__`; excluded from equality and repr so two
-    # Membership values still compare on the spans that define them.
-    _by_symbol: dict[str, tuple[MembershipSpan, ...]] = field(
-        init=False, repr=False, compare=False, default_factory=dict
-    )
-
-    def __post_init__(self) -> None:
-        """Index the spans by symbol once, at construction.
-
-        `span_on` is the hot call of the whole backtest: §2.4's coverage asks it
-        once per member-week (262k times) and B2's daily exit loop several times
-        that. Scanning all ~900 spans per call made it 95% of the coverage
-        runtime, for a lookup that is a dict hit. The dataclass is frozen — this
-        is the sanctioned way to derive a field on one.
-        """
-        grouped: dict[str, list[MembershipSpan]] = {}
-        for span in self.spans:
-            grouped.setdefault(span.symbol, []).append(span)
-        object.__setattr__(
-            self,
-            "_by_symbol",
-            {
-                symbol: tuple(sorted(spans, key=lambda span: span.added))
-                for symbol, spans in grouped.items()
-            },
-        )
 
     def __post_init__(self) -> None:
         """Group the spans by symbol once, at construction.
@@ -139,7 +113,7 @@ class Membership:
 
     @property
     def symbols(self) -> tuple[str, ...]:
-        return tuple(sorted(self._by_symbol))
+        return tuple(sorted({span.symbol for span in self.spans}))
 
     def spans_for(self, symbol: str) -> tuple[MembershipSpan, ...]:
         return self._by_symbol.get(symbol, ())

@@ -21,6 +21,7 @@ from datetime import date
 import numpy as np
 import pandas as pd
 
+from leaps_scanner.backtest import data
 from leaps_scanner.backtest.engine import SkippedEntry, Trade
 
 RETURN_PERCENTILES = (5, 25, 50, 75, 95)
@@ -72,10 +73,19 @@ class TrackAStats:
     # thin benchmark shows up as a count rather than as a quietly smaller mean.
     market_delta: Mapping[str, float | None]
     market_delta_unpriced: int
+    # §2.4 / acceptance 2: coverage below 85% must put a visible warning on every
+    # headline table, and this *is* a headline table. Carried on the statistics
+    # rather than left in a log line, so the warning cannot be separated from the
+    # numbers it qualifies. `None` means coverage was not measured for this run —
+    # which is not the same claim as "coverage was fine".
+    coverage_ratio: float | None = None
+    low_coverage_warning: bool | None = None
 
     def as_dict(self) -> dict:
         return {
             "variant": self.variant,
+            "coverage_ratio": self.coverage_ratio,
+            "low_coverage_warning": self.low_coverage_warning,
             "trades": self.trades,
             "chains": self.chains,
             "wins": self.wins,
@@ -132,8 +142,15 @@ def track_a(
     trades: Sequence[Trade],
     skipped: Sequence[SkippedEntry],
     benchmark: BenchmarkPrices,
+    *,
+    coverage: data.Coverage | None = None,
 ) -> TrackAStats:
-    """Summarize one variant's trades exactly as §6.1 lists them."""
+    """Summarize one variant's trades exactly as §6.1 lists them.
+
+    `coverage` travels with the table on purpose (acceptance 2): a headline
+    statistic and the share of the universe behind it belong to the same object,
+    so no caller can print one without the other.
+    """
     returns = np.array([trade.r_trade for trade in trades], dtype="float64")
     held = np.array([trade.holding_days for trade in trades], dtype="float64")
 
@@ -188,6 +205,8 @@ def track_a(
         skipped_entries=dict(sorted(skipped_counts.items())),
         market_delta=_summary(delta_values),
         market_delta_unpriced=unpriced,
+        coverage_ratio=None if coverage is None else round(coverage.ratio, 6),
+        low_coverage_warning=None if coverage is None else coverage.low_coverage_warning,
     )
 
 

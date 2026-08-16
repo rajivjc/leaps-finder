@@ -15,6 +15,7 @@
   "track_a": {
     "base": {
       "chains": 3,
+      "coverage_ratio": null,
       "exit_reasons": {
         "delisted": 1,
         "end_of_window": 1,
@@ -27,6 +28,7 @@
         "median": 34.0,
         "min": 3.0
       },
+      "low_coverage_warning": null,
       "market_delta": {
         "max": 0.10620388412657722,
         "mean": -0.031149247339393744,
@@ -60,6 +62,7 @@
     },
     "strict": {
       "chains": 3,
+      "coverage_ratio": null,
       "exit_reasons": {
         "end_of_window": 1,
         "stoch_below_20": 1,
@@ -71,6 +74,7 @@
         "median": 31.0,
         "min": 3.0
       },
+      "low_coverage_warning": null,
       "market_delta": {
         "max": 0.04243228384598641,
         "mean": -0.058808482041379874,

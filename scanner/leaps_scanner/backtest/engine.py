@@ -426,15 +426,28 @@ def _replay(
     trades: list[Trade] = []
     skipped: list[SkippedEntry] = []
     open_trade: dict | None = None
-    pending_exit: tuple[date, str] | None = None
-    pending_entry: tuple[int, date] | None = None  # (label index, signal date)
+    # Both pendings carry the session index they fill at, resolved when the
+    # signal fires: "next available bar" is a property of the data, so it is
+    # answered once rather than assumed to be the next row.
+    pending_exit: tuple[date, str, int] | None = None
+    pending_entry: tuple[int, date, int] | None = None
+
+    def skip(label: int, signal_date: date, reason: str) -> None:
+        skipped.append(
+            SkippedEntry(
+                chain=panel.chain,
+                symbol=book.member_fridays[panel.label_dates[label]],
+                signal_date=signal_date,
+                reason=reason,
+            )
+        )
 
     for index in range(last + 1):
         today = sessions[index]
 
         # -- fills, at the open, from decisions taken at a previous close ------
-        if pending_exit is not None and open_trade is not None:
-            signalled, reason = pending_exit
+        if pending_exit is not None and open_trade is not None and pending_exit[2] == index:
+            signalled, reason, _ = pending_exit
             trades.append(
                 _close_trade(
                     open_trade,
@@ -447,8 +460,8 @@ def _replay(
             )
             open_trade, pending_exit = None, None
 
-        if pending_entry is not None and open_trade is None:
-            label, signalled = pending_entry
+        if pending_entry is not None and open_trade is None and pending_entry[2] == index:
+            label, signalled, _ = pending_entry
             open_trade = {
                 "chain": panel.chain,
                 "symbol": book.member_fridays[panel.label_dates[label]],
@@ -462,51 +475,87 @@ def _replay(
         # -- decisions, at the close ------------------------------------------
         if open_trade is not None:
             if index == last:
-                trades.append(
-                    _close_trade(
-                        open_trade,
-                        exit_date=today,
-                        exit_price=float(panel.close[index]),
-                        exit_basis="close",
-                        exit_reason=final_reason,
-                        exit_signal_date=None,
+                mark = _final_mark(panel, last)
+                if mark is None:
+                    # Nothing to mark against anywhere in the series. Dropping a
+                    # trade is bad; inventing a closing price is worse, and a
+                    # silent drop is worst — so it is dropped loudly.
+                    logger.warning(
+                        "%s: trade entered %s cannot be marked, no usable close in the series",
+                        panel.chain,
+                        open_trade["entry_date"],
                     )
-                )
+                else:
+                    trades.append(
+                        _close_trade(
+                            open_trade,
+                            exit_date=sessions[mark],
+                            exit_price=float(panel.close[mark]),
+                            exit_basis="close",
+                            exit_reason=final_reason,
+                            exit_signal_date=None,
+                        )
+                    )
                 open_trade = None
                 break
-            reason = _exit_reason(panel, index, open_trade["entry_date"])
-            if reason is not None:
-                pending_exit = (today, reason)
+            if pending_exit is None:
+                reason = _exit_reason(panel, index, open_trade["entry_date"])
+                # No tradeable bar left: §4.3 marks at the last available close,
+                # which is exactly what the `index == last` branch above does, so
+                # the signal is left to fall through to it.
+                if reason is not None and (fill := _next_fill(panel, index, last)) is not None:
+                    pending_exit = (today, reason, fill)
             continue
 
         label = signal_label.get(index)
         if label is None:
             continue
-        if index == last:
-            # §4.3: the window ends before any bar could fill this signal, and a
-            # same-close fill is forbidden. Skipped, logged, counted.
-            skipped.append(
-                SkippedEntry(
-                    chain=panel.chain,
-                    symbol=book.member_fridays[panel.label_dates[label]],
-                    signal_date=today,
-                    reason="no_fill",
-                )
-            )
+        fill = _next_fill(panel, index, last)
+        if fill is None:
+            # §4.3: no bar left to fill against — and a same-close fill is what
+            # the spec forbids outright. Skipped, logged, counted.
+            skip(label, today, "no_fill")
             continue
-        if _sessions_between(calendar, today, sessions[index + 1]) > MAX_FILL_SESSIONS:
-            skipped.append(
-                SkippedEntry(
-                    chain=panel.chain,
-                    symbol=book.member_fridays[panel.label_dates[label]],
-                    signal_date=today,
-                    reason="halt_too_long",
-                )
-            )
+        if _sessions_between(calendar, today, sessions[fill]) > MAX_FILL_SESSIONS:
+            skip(label, today, "halt_too_long")
             continue
-        pending_entry = (label, today)
+        pending_entry = (label, today, fill)
 
     return tuple(trades), tuple(skipped)
+
+
+def _tradeable(price: float) -> bool:
+    """Whether a quote can stand as a fill.
+
+    A NaN reaches `r_trade` and then `json.dumps`, which writes a bare `NaN`
+    that is not valid JSON — so §8's machine-readable output would be
+    unparseable, and every §6.1 statistic downstream of it would be NaN. A
+    non-positive price is the same class of bad quote. The signal inputs are
+    already guarded this way in `_entry_ready`, and the benchmark leg in
+    `metrics.BenchmarkPrices`; the trade's own fill is guarded here.
+    """
+    return bool(np.isfinite(price)) and price > 0
+
+
+def _next_fill(panel: Panel, after: int, last: int) -> int | None:
+    """The next bar a signal at `after`'s close can actually be filled at (§4.3).
+
+    "Next available bar" means one that can be traded, not merely the next row:
+    a session quoted with no usable open is not a fill, it is a gap, and the
+    entry search continues past it under the same five-session cap.
+    """
+    for index in range(after + 1, last + 1):
+        if _tradeable(panel.open_[index]):
+            return index
+    return None
+
+
+def _final_mark(panel: Panel, last: int) -> int | None:
+    """The last close a forced §4.4 mark can be taken at, searching backwards."""
+    for index in range(last, -1, -1):
+        if _tradeable(panel.close[index]):
+            return index
+    return None
 
 
 def _entry_signals(

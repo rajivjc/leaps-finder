@@ -144,7 +144,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.coverage_only:
         return 0
 
-    _run_engine(membership, cache, window, args)
+    _run_engine(membership, cache, window, coverage, args)
     return 0
 
 
@@ -152,9 +152,15 @@ def _run_engine(
     membership: Membership,
     cache: data.PriceCache,
     window: data.Window,
+    coverage: data.Coverage,
     args: argparse.Namespace,
 ) -> None:
-    """§4's replay and §6.1's Track A tables, for the stock track."""
+    """§4's replay and §6.1's Track A tables, for the stock track.
+
+    `coverage` is passed into the statistics rather than merely logged above:
+    acceptance 2 wants the low-coverage warning on every headline table, and
+    these are headline tables.
+    """
     result = engine.run(membership, cache, window)
     logger.info(
         "engine: %d rename chains, %d priced; %s",
@@ -165,7 +171,9 @@ def _run_engine(
 
     benchmark = metrics.BenchmarkPrices(cache.load_benchmark())
     stats = [
-        metrics.track_a(name, result.trades[name], result.skipped[name], benchmark)
+        metrics.track_a(
+            name, result.trades[name], result.skipped[name], benchmark, coverage=coverage
+        )
         for name in result.trades
     ]
 
@@ -193,14 +201,28 @@ def _trades_json(result: engine.EngineResult) -> str:
 def _track_a_line(stats: metrics.TrackAStats) -> str:
     """One line per variant. P13: Strict is reported alongside, not as headline."""
     label = "" if stats.variant == "base" else f" [{stats.variant} zone variant, not headline]"
+    if stats.low_coverage_warning:
+        # Acceptance 2: below 85% the warning rides on the table itself, ahead of
+        # the numbers, where it cannot be read separately from them.
+        label += f" [LOW COVERAGE {100 * (stats.coverage_ratio or 0):.1f}%]"
     if not stats.trades:
         return f"track A {stats.variant}: no trades{label}"
+
+    # A missing benchmark is reported as missing. Printing `+0.00%` for "not
+    # computed" would state a measured match with the market that never happened
+    # — the same null-vs-zero mistake `indicators._finite` exists to avoid.
+    market_delta = stats.market_delta["mean"]
+    delta_text = (
+        f"{100 * market_delta:+.2f}%"
+        if market_delta is not None
+        else f"n/a ({stats.market_delta_unpriced} trades unpriced)"
+    )
     return (
         f"track A {stats.variant}: {stats.trades} trades over {stats.chains} names, "
-        f"win rate {100 * (stats.win_rate or 0):.1f}%, "
-        f"mean {100 * (stats.mean_return or 0):+.2f}%, "
-        f"median {100 * (stats.median_return or 0):+.2f}%, "
-        f"market delta {100 * (stats.market_delta['mean'] or 0):+.2f}%{label}"
+        f"win rate {100 * stats.win_rate:.1f}%, "
+        f"mean {100 * stats.mean_return:+.2f}%, "
+        f"median {100 * stats.median_return:+.2f}%, "
+        f"market delta {delta_text}{label}"
     )
 
 

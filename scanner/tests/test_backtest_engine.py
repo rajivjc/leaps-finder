@@ -20,6 +20,7 @@ import pandas as pd
 import pytest
 
 from leaps_scanner import indicators
+from leaps_scanner.backtest import __main__ as backtest_main
 from leaps_scanner.backtest import data, engine, metrics
 from leaps_scanner.backtest.membership import Membership
 
@@ -725,6 +726,217 @@ class TestTrackA:
         # JSON-safe: no NaN or infinity can reach `results.json` (§8).
         assert "NaN" not in metrics.track_a_json([stats])
         assert "Infinity" not in metrics.track_a_json([stats])
+
+
+class TestUnusableQuotes:
+    """A quote that cannot be traded is a gap, not a fill price."""
+
+    def _book(self) -> engine.Book:
+        return engine.Book(
+            chain="AAA",
+            member_fridays={
+                friday: "AAA"
+                for friday in data.week_endings(FIXTURE_WINDOW.start, FIXTURE_WINDOW.end)
+            },
+        )
+
+    def _calendar(self) -> list[date]:
+        return [
+            day
+            for day in business_days(FIXTURE_START, FIXTURE_END)
+            if FIXTURE_WINDOW.start <= day <= FIXTURE_WINDOW.end
+        ]
+
+    def test_tradeable_rejects_nan_and_non_positive(self) -> None:
+        assert engine._tradeable(12.5) is True
+        assert engine._tradeable(float("nan")) is False
+        assert engine._tradeable(0.0) is False
+        assert engine._tradeable(-3.0) is False
+
+    def test_entry_fills_at_the_next_tradeable_open(self) -> None:
+        """A blank open is skipped over, not filled against."""
+        frame = fixture_frames()["AAA"]
+        book, calendar = self._book(), self._calendar()
+        control, _ = engine._replay(
+            book,
+            engine.build_panel("AAA", frame),
+            FIXTURE_WINDOW,
+            calendar,
+            engine.BASE_ZONE_HIGH,
+        )
+        first = control[0]
+
+        gapped = frame.copy()
+        gapped.loc[pd.Timestamp(first.entry_date), "Open"] = float("nan")
+        sessions = [stamp.date() for stamp in pd.DatetimeIndex(frame.index)]
+        after = sessions[sessions.index(first.entry_date) + 1]
+
+        trades, skipped = engine._replay(
+            book,
+            engine.build_panel("AAA", gapped),
+            FIXTURE_WINDOW,
+            calendar,
+            engine.BASE_ZONE_HIGH,
+        )
+        moved = [t for t in trades if t.signal_date == first.signal_date]
+        assert len(moved) == 1
+        assert moved[0].entry_date == after
+        assert moved[0].entry_price == pytest.approx(gapped["Open"].loc[pd.Timestamp(after)])
+        assert not any(entry.signal_date == first.signal_date for entry in skipped)
+
+    def test_a_signal_with_no_tradeable_bar_left_is_skipped(self) -> None:
+        """Every remaining open blanked: no fill exists, so no trade is invented."""
+        frame = fixture_frames()["AAA"]
+        book, calendar = self._book(), self._calendar()
+        control, _ = engine._replay(
+            book,
+            engine.build_panel("AAA", frame),
+            FIXTURE_WINDOW,
+            calendar,
+            engine.BASE_ZONE_HIGH,
+        )
+        first = control[0]
+
+        blanked = frame.copy()
+        blanked.loc[pd.Timestamp(first.signal_date) :, "Open"] = float("nan")
+        trades, skipped = engine._replay(
+            book,
+            engine.build_panel("AAA", blanked),
+            FIXTURE_WINDOW,
+            calendar,
+            engine.BASE_ZONE_HIGH,
+        )
+
+        assert all(trade.signal_date != first.signal_date for trade in trades)
+        assert any(
+            entry.signal_date == first.signal_date and entry.reason == "no_fill"
+            for entry in skipped
+        )
+        assert all(engine._tradeable(trade.entry_price) for trade in trades)
+
+    def test_forced_mark_falls_back_to_the_last_usable_close(
+        self, fixture_membership: Membership, fixture_cache: data.PriceCache
+    ) -> None:
+        """§4.4's mark needs a real close, not whichever row happens to be last."""
+        result = engine.run(fixture_membership, fixture_cache, FIXTURE_WINDOW)
+        marked = [t for t in result.trades["base"] if t.exit_reason == "end_of_window"]
+        assert marked, "the fixture must end holding a position"
+        held = marked[0]
+
+        books = {b.chain: b for b in engine.build_books(fixture_membership, FIXTURE_WINDOW)}
+        frame = fixture_frames()[held.chain]
+        sessions = [stamp.date() for stamp in pd.DatetimeIndex(frame.index)]
+        previous = sessions[sessions.index(held.exit_date) - 1]
+
+        blanked = frame.copy()
+        blanked.loc[pd.Timestamp(held.exit_date), "Close"] = float("nan")
+        trades, _ = engine._replay(
+            books[held.chain],
+            engine.build_panel(held.chain, blanked),
+            FIXTURE_WINDOW,
+            self._calendar(),
+            engine.BASE_ZONE_HIGH,
+        )
+        forced = [t for t in trades if t.exit_reason == "end_of_window"]
+        assert len(forced) == 1
+        assert forced[0].exit_date == previous
+        assert forced[0].exit_price == pytest.approx(blanked["Close"].loc[pd.Timestamp(previous)])
+
+    def test_no_trade_ever_carries_a_non_finite_price(
+        self, fixture_membership: Membership, tmp_path: Path
+    ) -> None:
+        """The end-to-end guarantee: §8's JSON stays parseable."""
+        cache = data.PriceCache(tmp_path / "holed")
+        for symbol, frame in fixture_frames().items():
+            holed = frame.copy()
+            # Blank one open per fortnight. `Close` is left alone deliberately:
+            # a NaN close poisons 200 sessions of SMA behind it, which suppresses
+            # the signals instead of stressing the fills this test is about.
+            holed.loc[pd.DatetimeIndex(holed.index)[::10], "Open"] = float("nan")
+            cache.store(symbol, holed)
+
+        result = engine.run(fixture_membership, cache, FIXTURE_WINDOW)
+        benchmark = metrics.BenchmarkPrices(cache.load_benchmark())
+        stats = [
+            metrics.track_a(name, result.trades[name], result.skipped[name], benchmark)
+            for name in result.trades
+        ]
+
+        for trades in result.trades.values():
+            assert trades
+            for trade in trades:
+                assert engine._tradeable(trade.entry_price)
+                assert engine._tradeable(trade.exit_price)
+        rendered = metrics.track_a_json(stats)
+        assert "NaN" not in rendered and "Infinity" not in rendered
+        json.loads(rendered)  # strict parse: the §8 contract
+
+
+class TestCoverageWarning:
+    """Acceptance 2: the warning travels with the headline table."""
+
+    def _coverage(self, ratio: float) -> data.Coverage:
+        return data.Coverage(
+            window=FIXTURE_WINDOW,
+            run_date=FIXTURE_WINDOW.end,
+            snapshot_date=None,
+            total_member_weeks=1000,
+            covered_member_weeks=int(1000 * ratio),
+            members=4,
+            no_data_members=0,
+        )
+
+    def _stats(self, coverage: data.Coverage | None) -> metrics.TrackAStats:
+        trade = engine.Trade(
+            chain="AAA",
+            symbol="AAA",
+            signal_date=date(2018, 3, 1),
+            entry_date=date(2018, 3, 2),
+            entry_price=100.0,
+            exit_date=date(2018, 6, 1),
+            exit_price=110.0,
+            exit_reason="time_exit",
+            exit_signal_date=date(2018, 5, 31),
+        )
+        return metrics.track_a(
+            "base", [trade], [], metrics.BenchmarkPrices(None), coverage=coverage
+        )
+
+    def test_low_coverage_reaches_the_json_and_the_line(self) -> None:
+        stats = self._stats(self._coverage(0.84))
+        assert stats.low_coverage_warning is True
+        assert stats.as_dict()["coverage_ratio"] == pytest.approx(0.84)
+        assert "LOW COVERAGE 84.0%" in backtest_main._track_a_line(stats)
+
+    def test_healthy_coverage_carries_no_warning(self) -> None:
+        stats = self._stats(self._coverage(0.927))
+        assert stats.low_coverage_warning is False
+        assert "LOW COVERAGE" not in backtest_main._track_a_line(stats)
+
+    def test_unmeasured_coverage_is_null_not_false(self) -> None:
+        """`None` says "not measured"; `False` would claim coverage was fine."""
+        stats = self._stats(None)
+        assert stats.low_coverage_warning is None
+        assert stats.as_dict()["coverage_ratio"] is None
+
+
+class TestMissingBenchmark:
+    """§3.5 lets a run continue without SPY — it must not invent the comparison."""
+
+    def test_market_delta_reports_absence_rather_than_zero(
+        self, fixture_membership: Membership, fixture_cache: data.PriceCache
+    ) -> None:
+        result = engine.run(fixture_membership, fixture_cache, FIXTURE_WINDOW)
+        stats = metrics.track_a(
+            "base", result.trades["base"], result.skipped["base"], metrics.BenchmarkPrices(None)
+        )
+
+        assert stats.market_delta["mean"] is None
+        assert stats.market_delta_unpriced == stats.trades
+
+        line = backtest_main._track_a_line(stats)
+        assert "market delta n/a" in line
+        assert "market delta +0.00%" not in line
 
 
 class TestDeterminism:
