@@ -338,6 +338,45 @@ class TestEntryRules:
             assert self.decide(**overrides)[1] == 0
 
 
+class TestEntryScheduling:
+    """A candidate must be funded or declined — never quietly dropped."""
+
+    def test_an_entry_off_the_session_calendar_is_still_evaluated(self, tmp_path: Path) -> None:
+        """Regression: an exact-date lookup lost the candidate entirely.
+
+        The calendar comes from the benchmark's sessions, so a chain that filled
+        on a day the benchmark did not trade would match no key. It was then
+        neither funded nor counted as declined, and the report's "declined N of M
+        available signals" silently stopped adding up.
+        """
+        cache = flat_cache(tmp_path, ["A"])
+        calendar = [day for day in business_days(FIXTURE_START, FIXTURE_END) if day >= WINDOW.start]
+        off_calendar = date(2021, 3, 3)
+        assert off_calendar in calendar
+        trimmed = [day for day in calendar if day != off_calendar]
+
+        trade = make_trade("A", off_calendar, date(2021, 9, 1), symbol="A")
+        result = sleeve.simulate(
+            [trade],
+            cache,
+            WINDOW,
+            sectors=sleeve.SectorLabels({"A": "Utilities"}),
+            calendar=trimmed,
+        )
+
+        # Funded on the next session the calendar does carry, and accounted for.
+        assert len(result.positions) + len(result.skipped) == 1
+        assert len(result.positions) == 1
+
+    def test_every_candidate_is_accounted_for(self, tmp_path: Path) -> None:
+        trades = [
+            make_trade(f"C{index}", date(2021, 3, 1), date(2021, 9, 1), symbol=f"C{index}")
+            for index in range(8)
+        ]
+        result = run_sleeve(tmp_path, trades)
+        assert len(result.positions) + len(result.skipped) == len(trades)
+
+
 class TestCircuitBreaker:
     """§6.2's breaker, on `risk.py`'s arithmetic (§9's named fixture)."""
 
@@ -378,6 +417,57 @@ class TestCircuitBreaker:
         assert result.breaker_dates, "an ~8.8% realized loss is past the 8% breaker"
         # Evaluated at the close, so the ban starts the following session.
         assert min(result.breaker_dates) >= max(entries)
+
+    def test_one_loss_event_is_one_activation_not_one_per_session(self, tmp_path: Path) -> None:
+        """Regression: the breaker's condition is a state, not an event.
+
+        The trailing 28-day realized window holds the same losses in view for 28
+        days, so an unlatched check re-fired on every session in that span. Each
+        re-fire pushed the ban another 28 days out — a single loss event banned
+        entries for ~53 days instead of §6.2's 28 — and `breaker_dates` counted
+        sessions in the loss state rather than breaker events.
+        """
+        entries = [date(2021, 3, 1), date(2021, 3, 2), date(2021, 3, 3)]
+        result = run_sleeve(tmp_path, self.losing_trades(entries), sectors=self.sectors(3))
+
+        assert len(result.breaker_dates) == 1, "one loss event is one activation"
+        # And the ban it implies is exactly §6.2's window, not a rolling multiple.
+        tripped = result.breaker_dates[0]
+        assert tripped + timedelta(days=risk.CIRCUIT_BREAKER_DAYS) < date(2021, 4, 30)
+
+    def test_it_can_trip_again_once_the_ban_has_lapsed(self, tmp_path: Path) -> None:
+        """Latched, not disarmed: a genuinely later trip still restarts the window.
+
+        The second cluster needs five positions rather than three: the first
+        cluster leaves equity near $91k, where a 3% budget buys two contracts
+        instead of three, so three more losses come to only ~6.3% of the entry
+        equity — under the breaker rather than over it. That is the sizing
+        granularity P9 is about, showing up in a fixture.
+        """
+        first = [date(2021, 3, 1), date(2021, 3, 2), date(2021, 3, 3)]
+        # A second cluster well past the first ban and its 28-day realized window.
+        second = [date(2021, 6, day) for day in (1, 2, 3, 4, 7)]
+        later = [
+            make_trade(
+                f"M{index}",
+                entry,
+                entry + timedelta(days=5),
+                symbol=f"M{index}",
+                entry_cost=10.0,
+                exit_value=10.0 * self.LOSS,
+                exit_reason="premium_stop",
+            )
+            for index, entry in enumerate(second)
+        ]
+        sectors = {
+            **self.sectors(3),
+            **{f"M{index}": f"Later{index}" for index in range(len(second))},
+        }
+        result = run_sleeve(tmp_path, [*self.losing_trades(first), *later], sectors=sectors)
+
+        assert len(result.breaker_dates) == 2, "two separate loss events, two activations"
+        gap = (result.breaker_dates[1] - result.breaker_dates[0]).days
+        assert gap > risk.CIRCUIT_BREAKER_DAYS
 
     def test_a_tripped_breaker_blocks_the_next_entry(self, tmp_path: Path) -> None:
         entries = [date(2021, 3, 1), date(2021, 3, 2), date(2021, 3, 3)]

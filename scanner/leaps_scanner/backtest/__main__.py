@@ -164,8 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.coverage_only:
         return 0
 
-    _run_engine(membership, cache, window, coverage, args)
-    return 0
+    return _run_engine(membership, cache, window, coverage, args)
 
 
 def _run_engine(
@@ -174,8 +173,13 @@ def _run_engine(
     window: data.Window,
     coverage: data.Coverage,
     args: argparse.Namespace,
-) -> None:
+) -> int:
     """§4's replay and §6.1's Track A tables, for both tracks.
+
+    Returns the process exit status, so a run that was asked for a report and
+    could not produce one fails loudly. A caller gating on `$?` would otherwise
+    read "nothing written" as success and go on to deploy whatever stale report
+    was already committed.
 
     `coverage` is passed into the statistics rather than merely logged above:
     acceptance 2 wants the low-coverage warning on every headline table, and
@@ -218,8 +222,12 @@ def _run_engine(
 
     if args.no_sleeve or not overlays:
         if args.report_dir:
-            logger.error("--report-dir needs the sleeve and the overlay; nothing written")
-        return
+            logger.error(
+                "--report-dir needs the sleeve and the overlay, but %s was passed: nothing written",
+                "--no-sleeve" if args.no_sleeve else "--no-overlay",
+            )
+            return 1
+        return 0
 
     sleeves, benchmarks, calendar, unlabelled = _run_sleeve(
         result, overlays, cache, window, coverage
@@ -245,6 +253,7 @@ def _run_engine(
             directory,
         )
         print(f"wrote {len(written)} files to {directory}", file=sys.stderr)
+    return 0
 
 
 def _run_date_of(coverage: data.Coverage) -> str:

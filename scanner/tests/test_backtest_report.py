@@ -62,6 +62,16 @@ class TestBanner:
         with pytest.raises(ValueError, match="banner"):
             report.results_json({"schema_version": 1, "banner": "   "})
 
+    def test_a_non_string_banner_is_refused_by_the_writer_too(self) -> None:
+        """Regression: `str(42)` reads as a non-empty banner.
+
+        `lib/backtest.ts` requires a `string`, so a coerced check here would let a
+        file be written locally that only fails later, as a broken deploy.
+        """
+        for bad in (42, True, ["x"], {"text": "x"}):
+            with pytest.raises(ValueError, match="banner"):
+                report.results_json({"schema_version": 1, "banner": bad})
+
     def test_the_report_carries_the_banner_the_register_and_the_grid(self, tmp_path: Path) -> None:
         """Acceptance 6, on the markdown side."""
         markdown = report.build_markdown(sample_inputs(tmp_path))

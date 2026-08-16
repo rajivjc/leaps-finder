@@ -199,10 +199,14 @@ def _portable(payload: object) -> object:
 
 def results_json(payload: Mapping[str, object]) -> str:
     """Stable serialization — acceptance 1 wants two runs byte-identical."""
-    if not str(payload.get("banner") or "").strip():
+    banner = payload.get("banner")
+    if not isinstance(banner, str) or not banner.strip():
         # §8: the web build fails without it, so the writer refuses to produce a
-        # file the build is guaranteed to reject.
-        raise ValueError("results.json requires a non-empty top-level `banner` (§8)")
+        # file the build is guaranteed to reject. The type check matters as much
+        # as the emptiness one — `lib/backtest.ts` requires a `string`, so a
+        # coercion here (`str(42)` reads as non-empty) would let a bad file be
+        # written locally and surface only as a failed deploy.
+        raise ValueError("results.json requires a non-empty string `banner` (§8)")
     return json.dumps(_portable(payload), indent=2, sort_keys=True) + "\n"
 
 

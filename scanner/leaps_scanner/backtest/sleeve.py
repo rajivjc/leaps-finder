@@ -416,6 +416,11 @@ def simulate(
     banned_through: date | None = None
     next_id = 1
 
+    # Entry dates in order, consumed by the walk rather than looked up by exact
+    # date — see the entry block below for why the lookup was not enough.
+    entry_dates = sorted(entries)
+    next_entry = 0
+
     for today in calendar:
         # -- exits, at the open ------------------------------------------------
         # Scanned rather than looked up by date: a chain can in principle exit on
@@ -433,7 +438,19 @@ def simulate(
             cash += position.proceeds
 
         # -- entries, at the open ----------------------------------------------
-        for trade in entries.get(today, ()):
+        # Consumed by date order rather than matched exactly, for the same reason
+        # the exits above are scanned: an entry filling on a session the calendar
+        # does not carry would otherwise be dropped silently — neither funded nor
+        # counted as declined — and the report's "declined N of M signals" would
+        # quietly stop adding up. Dates are consumed in ascending order, and each
+        # date's list is already in P10 order, so the tie-break still holds when
+        # two dates land on one session.
+        due_entries: list[SyntheticTrade] = []
+        while next_entry < len(entry_dates) and entry_dates[next_entry] <= today:
+            due_entries.extend(entries[entry_dates[next_entry]])
+            next_entry += 1
+
+        for trade in due_entries:
             symbol = trade.trade.symbol
             sector = sectors.sector_of(symbol)
             equity = cash + sum(
@@ -515,11 +532,38 @@ def simulate(
             today,
         )
         fraction = pnl.loss_fraction
-        if fraction is not None and fraction >= risk.CIRCUIT_BREAKER_LOSS_FRACTION:
-            # §6.2: the window restarts on any later trip, so a breaker that is
-            # already latched still extends its own ban.
+        tripped = fraction is not None and fraction >= risk.CIRCUIT_BREAKER_LOSS_FRACTION
+        latched = banned_through is not None and today <= banned_through
+        if tripped and not latched:
+            # **Latched, because the breaker's condition is a state, not an event.**
+            # The trailing 28-day realized window keeps the same losses in view for
+            # 28 days, so an unlatched check re-fires on every session in that span:
+            # each one would push `banned_through` forward by another 28 days, and a
+            # single loss event would ban entries for roughly 56 days rather than
+            # §6.2's 28 — while `breaker_dates` counted sessions in the loss state
+            # instead of breaker events. `risk.py`'s module docstring names this
+            # hazard exactly ("a state re-fires every single day it holds") and adds
+            # suppression for it; this is the same idea in the simulation.
+            #
+            # §6.2's "the window restarting on any later trip" is therefore read as
+            # a *later* trip: one that happens once the ban has lapsed. While the
+            # ban is in force there are no new entries to block, so re-arming it
+            # against the same unchanged loss buys nothing and overstates both the
+            # ban and the activation count.
             banned_through = today + timedelta(days=risk.CIRCUIT_BREAKER_DAYS)
             breaker_dates.append(today)
+
+    if next_entry < len(entry_dates):
+        # Candidates dated past the last session: the calendar ran out before the
+        # signals did. Counted out loud rather than dropped in silence, because a
+        # missing candidate is invisible in every ratio the report prints.
+        stranded = sum(len(entries[day]) for day in entry_dates[next_entry:])
+        logger.warning(
+            "%s: %d candidate(s) after the last session %s were never evaluated",
+            config.name,
+            stranded,
+            curve_dates[-1] if curve_dates else window.end,
+        )
 
     drawdown, drawdown_date = metrics.max_drawdown(curve_dates, curve_equity)
     wins = sum(1 for position in closed_positions if position.profit > 0)
