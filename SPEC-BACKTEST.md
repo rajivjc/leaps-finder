@@ -98,6 +98,9 @@ the exact string travels as the required `banner` field of `results.json` (§8).
    successor. A span-scoped alias also cannot double-count, since spans do not overlap
    and the successor's series is only ever read inside the aliased span.
 
+   A rename is a bookkeeping event, not a market event: an open simulated trade carries
+   across the boundary rather than closing at it (§4.3a).
+
    A chain whose terminal ticker has no data — the successor was itself acquired and
    purged, as with `COG → CTRA` — is **not an error**. Resolution succeeds, the span
    stays uncovered, and §2.4 reports it as the survivorship gap it genuinely is. The CSV
@@ -198,6 +201,35 @@ within 5 NYSE trading days, the entry is skipped and logged — a longer halt is
 information. No same-close fills (that would use the closing price that produced the
 signal).
 
+**Entries at the window edge.** A signal on the final evaluation Friday has no subsequent
+bar at all, so the general rule's "last available close" fallback would fill it at the very
+close that produced it — which the preceding sentence forbids. Entries therefore resolve
+the conflict the way §4.3 already resolves an over-long halt: no fill available ⇒ the entry
+is skipped and logged. The fallback governs **exits** only, where marking at the final
+close is what §4.4's `end_of_window` explicitly asks for.
+
+### 4.3a Position identity across a re-ticker (RC, 2026-08-16)
+
+A §2.3a rename does not interrupt a trade. The old and new tickers are one security with
+one continuous price series, so a position open across the boundary is **one trade**: it
+keeps its entry fill, keeps running on the successor's series, and exits only when a §4.4
+rule fires. Force-exiting at the boundary would book a round-trip the holder never made,
+count a bookkeeping event as a `delisted` outcome, and (from B3) charge two friction
+haircuts on a day nothing happened.
+
+Consequently the engine's unit of position identity is the **rename chain**, named by the
+terminal ticker `Membership.price_source` resolves to, not the membership symbol. P8's "one
+open trade per symbol per track" reads as one open trade per chain: an open `FB` trade
+blocks a `META` entry, because they are the same company. The converse also holds, and is
+why the key is the chain rather than the symbol — a recycled ticker (`IR`) resolves to
+*different* chains before and after the recycle, which may hold concurrent independent
+trades. Each trade records the membership symbol in force on its entry date.
+
+Membership itself gates **entries only**. A symbol dropped from the index mid-trade is not
+an exit: §4.4's rules are exhaustive, none of them is "left the index", and SPEC.md §7 has
+no such rule either. The position runs on price data until a §4.4 rule fires — which, for
+the common case where removal *is* an acquisition, is `delisted` on the next session.
+
 ### 4.4 Exits
 
 Evaluated per SPEC.md §7, restricted to what is reconstructable:
@@ -218,6 +250,14 @@ time_exit`; the fill (next open) is identical regardless. Crossing semantics are
 
 Trades still open at the end of the window are marked at the final close, flagged
 `end_of_window`, included in the statistics, and their count disclosed.
+
+`delisted` and `end_of_window` are told apart on the trading calendar, not on a tolerance:
+a series is `delisted` iff at least one NYSE session falls after its last bar and at or
+before the window end — the symbol stopped trading before the market did. The calendar is
+the benchmark series' own session index (SPY trades every NYSE session), falling back to
+the union of cached member sessions when the benchmark is unavailable per §3.5. A symbol
+merely missing the window's final session therefore counts as `delisted`; that is a data
+gap wearing the honest label rather than a fudge factor, and §6.1 discloses the count.
 
 ### 4.5 Stock-track P&L
 
