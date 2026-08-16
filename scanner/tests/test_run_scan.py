@@ -47,6 +47,8 @@ class FakeTable:
         self._select_rows = select_rows if select_rows is not None else []
         self._pending = None
         self._range = None
+        self._limit = None
+        self._filters = []
 
     def insert(self, rows):
         self._pending = ("insert", rows)
@@ -65,7 +67,13 @@ class FakeTable:
         return self
 
     def eq(self, column, value):
+        self._filters.append((column, value))
         return self
+
+    def _matches(self, row):
+        # Rows that simply do not carry the filtered column pass through: the
+        # fixtures are partial rows, not full table records.
+        return all(column not in row or row[column] == value for column, value in self._filters)
 
     def gte(self, column, value):
         return self
@@ -73,7 +81,18 @@ class FakeTable:
     def lte(self, column, value):
         return self
 
-    def order(self, column):
+    def order(self, column, desc=False):
+        return self
+
+    def limit(self, count):
+        self._limit = count
+        return self
+
+    @property
+    def not_(self):
+        return self
+
+    def is_(self, column, value):
         return self
 
     def range(self, start, end):
@@ -86,9 +105,11 @@ class FakeTable:
             raise RuntimeError(f"PostgREST 503 on {self._name}.{verb}")
         self._log.append((self._name, verb, payload))
         if verb == "select":
-            rows = self._select_rows
+            rows = [row for row in self._select_rows if self._matches(row)]
             if self._range is not None:
                 rows = rows[self._range[0] : self._range[1] + 1]
+            if self._limit is not None:
+                rows = rows[: self._limit]
             return FakeResponse(rows)
         if self._name == "scans" and verb == "insert":
             return FakeResponse([{"id": 7}])
@@ -154,6 +175,18 @@ def batch_downloader(frame: pd.DataFrame):
         )
 
     return downloader
+
+
+def drop_symbol(downloader, missing: str):
+    """Wrap a downloader so one symbol comes back with no columns at all —
+    yfinance's way of reporting a failure (an empty result, not an exception)."""
+
+    def wrapped(symbols, period):
+        frame = downloader(symbols, period)
+        keep = [column for column in frame.columns if column[0] != missing]
+        return frame[keep]
+
+    return wrapped
 
 
 def calls_frame(rows) -> pd.DataFrame:
@@ -756,12 +789,45 @@ class TestCli:
         assert run_scan.main(["full"]) == 2
         assert "SUPABASE_URL" in capsys.readouterr().err
 
-    def test_refresh_is_still_a_later_milestone(self, monkeypatch):
-        for key, value in VALID_ENV.items():
-            monkeypatch.setenv(key, value)
+    def test_refresh_returns_nonzero_when_the_run_failed(self, monkeypatch):
+        monkeypatch.setattr(db, "service_client", lambda: FakeClient())
+        monkeypatch.setattr(
+            run_scan,
+            "run_daily_refresh",
+            lambda client: run_scan.RefreshReport(
+                as_of_date=AS_OF,
+                universe_count=10,
+                priced_count=10,
+                iv_failures=0,
+                positions_count=1,
+                marks_count=0,
+                alerts_count=0,
+                status=db.STATUS_FAILED,
+                notes="premium stop not evaluated",
+            ),
+        )
 
-        with pytest.raises(NotImplementedError):
-            run_scan.main(["refresh"])
+        assert run_scan.daily_refresh() == 1
+
+    def test_refresh_returns_zero_on_a_complete_run(self, monkeypatch):
+        monkeypatch.setattr(db, "service_client", lambda: FakeClient())
+        monkeypatch.setattr(
+            run_scan,
+            "run_daily_refresh",
+            lambda client: run_scan.RefreshReport(
+                as_of_date=AS_OF,
+                universe_count=10,
+                priced_count=10,
+                iv_failures=0,
+                positions_count=1,
+                marks_count=1,
+                alerts_count=0,
+                status=db.STATUS_OK,
+                notes="",
+            ),
+        )
+
+        assert run_scan.daily_refresh() == 0
 
     def test_full_scan_returns_nonzero_when_the_scan_failed(self, monkeypatch):
         monkeypatch.setattr(db, "service_client", lambda: FakeClient())
@@ -891,3 +957,410 @@ class TestScanRowLifecycle:
         report = self.run(client, batch_downloader(rising_frame()))
 
         assert client.rows("scans", "update")[0]["as_of_date"] == report.as_of_date.isoformat()
+
+
+# --------------------------------------------------------------------------
+# Daily refresh (SPEC.md §3 `refresh`, §7)
+# --------------------------------------------------------------------------
+
+
+OWNER = "11111111-1111-1111-1111-111111111111"
+
+
+def position_row(**overrides) -> dict:
+    base = {
+        "id": 1,
+        "user_id": OWNER,
+        "symbol": "AAA",
+        "opened_on": "2026-05-01",
+        "expiry": LEAP_EXPIRY.isoformat(),
+        "strike": 180.0,
+        "contracts": 2,
+        "entry_premium": 34.0,
+        "account_equity_at_entry": 250_000.0,
+        "status": "open",
+        "closed_on": None,
+        "exit_premium": None,
+    }
+    base.update(overrides)
+    return base
+
+
+class TestResolveSessionDate:
+    def test_the_majority_session_wins(self):
+        frames = {
+            "AAA": rising_frame(end="2026-08-14"),
+            "BBB": rising_frame(end="2026-08-14"),
+            "HALTED": rising_frame(end="2026-08-11"),
+        }
+
+        assert run_scan.resolve_session_date(frames, date(2000, 1, 1)) == date(2026, 8, 14)
+
+    def test_no_frames_falls_back(self):
+        assert run_scan.resolve_session_date({}, AS_OF) == AS_OF
+
+
+class TestAssessRefresh:
+    def test_a_clean_run_is_ok(self):
+        status, notes = run_scan.assess_refresh(100, 100, 0, 1, [])
+
+        assert status == db.STATUS_OK
+        assert "100/100" in notes
+
+    def test_an_unevaluated_exit_rule_fails_the_run_with_no_ceiling(self):
+        # One position out of one, and the universe half of the job was
+        # flawless — the run still fails. A missed stop is worse than a
+        # reported one.
+        status, notes = run_scan.assess_refresh(
+            100, 100, 0, 1, ["position 1 (AAA): premium_stop not evaluated"]
+        )
+
+        assert status == db.STATUS_FAILED
+        assert "premium_stop not evaluated" in notes
+
+    def test_the_twenty_percent_ceiling_still_applies_to_the_universe(self):
+        status, notes = run_scan.assess_refresh(100, 75, 0, 0, [])
+
+        assert status == db.STATUS_FAILED
+        assert "25.0%" in notes
+
+    def test_iv_failures_count_toward_the_ceiling(self):
+        status, _ = run_scan.assess_refresh(100, 100, 25, 0, [])
+
+        assert status == db.STATUS_FAILED
+
+    def test_an_empty_universe_says_to_run_a_full_scan(self):
+        status, notes = run_scan.assess_refresh(0, 0, 0, 0, [])
+
+        assert status == db.STATUS_FAILED
+        assert "full scan" in notes
+
+
+class TestRunDailyRefresh:
+    def client_with(self, positions=(), alerts=(), symbols=("AAA", "BBB")):
+        client = FakeClient()
+        client.select_rows["tickers"] = [{"symbol": symbol} for symbol in symbols]
+        client.select_rows["positions"] = list(positions)
+        client.select_rows["alerts"] = list(alerts)
+        client.select_rows["scans"] = [{"id": 5, "kind": "full", "as_of_date": AS_OF.isoformat()}]
+        client.select_rows["scan_results"] = [
+            {"symbol": "AAA", "next_earnings": (AS_OF + timedelta(days=10)).isoformat()}
+        ]
+        return client
+
+    def run(self, client, **kwargs):
+        arguments = dict(
+            downloader=batch_downloader(rising_frame()),
+            market_cap_fetcher=lambda symbol: 900e9,
+            expiries_fetcher=fake_expiries,
+            chain_fetcher=fake_chain,
+            sleeper=lambda _: None,
+            today=AS_OF,
+        )
+        arguments.update(kwargs)
+        return run_scan.run_daily_refresh(client, **arguments)
+
+    def test_it_refreshes_quotes_and_appends_snapshots_without_rescoring(self):
+        client = self.client_with()
+
+        report = self.run(client)
+
+        assert report.status == db.STATUS_OK
+        assert report.priced_count == 2
+        # §3: "No rescoring" — the refresh must never touch scan_results.
+        assert client.rows("scan_results", "upsert") == []
+        assert client.rows("weekly_bars", "upsert") == []
+
+        snapshots = client.rows("iv_snapshots", "upsert")[0]
+        assert {row["symbol"] for row in snapshots} == {"AAA", "BBB"}
+        assert all(row["snap_date"] == AS_OF.isoformat() for row in snapshots)
+
+        tickers = client.rows("tickers", "upsert")[0]
+        assert all(row["market_cap"] == 900e9 for row in tickers)
+
+    def test_the_scan_row_is_a_refresh_and_never_claims_matches(self):
+        client = self.client_with()
+
+        self.run(client)
+
+        opened = client.rows("scans", "insert")[0]
+        assert opened["kind"] == "refresh"
+        closed = client.rows("scans", "update")[0]
+        assert closed["status"] == db.STATUS_OK
+        # A refresh evaluates no filters, so a match count would be invented.
+        assert closed["matches_count"] == 0
+
+    def test_a_held_contract_is_marked_and_the_mark_is_kept(self):
+        client = self.client_with(positions=[position_row()])
+
+        report = self.run(client)
+
+        assert report.marks_count == 1
+        mark = client.rows("position_marks", "upsert")[0][0]
+        assert mark["position_id"] == 1
+        assert mark["mark_date"] == AS_OF.isoformat()
+        # The 180 strike in the LEAP fixture quotes 33.5 / 34.5.
+        assert mark["mid"] == pytest.approx(34.0)
+        # Provenance: the mark names the run that took it.
+        assert mark["scan_id"] == 7
+
+    def test_a_halved_premium_fires_a_stop_that_quotes_its_mark(self):
+        # Entry at 80 against a fixture mid of 34 — comfortably past the stop.
+        client = self.client_with(positions=[position_row(entry_premium=80.0)])
+
+        report = self.run(client)
+
+        assert report.alerts_count >= 1
+        alerts = client.rows("alerts", "insert")[0]
+        stop = next(row for row in alerts if row["kind"] == "premium_stop")
+        assert stop["as_of_date"] == AS_OF.isoformat()
+        assert stop["scan_id"] == 7
+        assert stop["user_id"] == OWNER
+        assert "34.00" in stop["message"]
+        assert AS_OF.isoformat() in stop["message"]
+
+    def test_the_weekly_rule_does_not_run_on_the_daily_cadence(self):
+        client = self.client_with(positions=[position_row()])
+
+        self.run(client)
+
+        written = client.rows("alerts", "insert")
+        kinds = {row["kind"] for batch in written for row in batch}
+        assert "stoch_below_20" not in kinds
+
+    def test_an_unmarkable_holding_fails_the_run(self):
+        # A strike that is not in the chain: the premium stop cannot be
+        # evaluated, so the refresh must not report itself as complete.
+        client = self.client_with(positions=[position_row(strike=999.0)])
+
+        report = self.run(client)
+
+        assert report.status == db.STATUS_FAILED
+        assert "premium_stop not evaluated" in report.notes
+
+    def test_an_existing_unacknowledged_alert_is_not_repeated(self):
+        client = self.client_with(
+            positions=[position_row(entry_premium=80.0)],
+            alerts=[
+                {
+                    "id": 1,
+                    "kind": "premium_stop",
+                    "created_at": (AS_OF - timedelta(days=1)).isoformat(),
+                    "position_id": 1,
+                    "as_of_date": (AS_OF - timedelta(days=1)).isoformat(),
+                    "acknowledged": False,
+                }
+            ],
+        )
+
+        self.run(client)
+
+        written = client.rows("alerts", "insert")
+        kinds = {row["kind"] for batch in written for row in batch}
+        assert "premium_stop" not in kinds
+
+    def test_an_unknown_earnings_date_does_not_fail_the_run(self):
+        # §7 calls the earnings heads-up informational, and a held name outside
+        # the last full scan has no stored date. Losing the heads-up is not
+        # losing an exit, and a build that goes red over it gets ignored.
+        client = self.client_with(positions=[position_row(symbol="GONE")], symbols=("AAA",))
+
+        report = self.run(client)
+
+        assert report.status == db.STATUS_OK
+
+    def test_a_held_name_missing_from_the_universe_is_still_priced(self):
+        client = self.client_with(positions=[position_row(symbol="GONE")], symbols=("AAA",))
+
+        self.run(client)
+
+        # Priced and evaluated, but not written back into `tickers`: universe
+        # membership is the full scan's decision.
+        assert {row["symbol"] for row in client.rows("tickers", "upsert")[0]} == {"AAA"}
+
+    def test_a_total_price_failure_is_recorded_rather_than_raised(self):
+        def exploding_downloader(symbols, period):
+            raise RuntimeError("Yahoo is down")
+
+        client = self.client_with()
+        report = self.run(client, downloader=exploding_downloader)
+
+        # yfinance failures are absorbed by the retry loop, so the run finishes
+        # — but it finishes `failed`, over §9's ceiling.
+        assert report.status == db.STATUS_FAILED
+        assert report.priced_count == 0
+        assert client.rows("scans", "update")[0]["status"] == db.STATUS_FAILED
+
+    def test_a_crashed_refresh_still_closes_its_scan_row(self):
+        # A database read that dies mid-run must leave a `failed` row, not a
+        # row stuck on `running` forever.
+        client = self.client_with()
+        client._fail_on = ("tickers", "select")
+
+        with pytest.raises(RuntimeError):
+            self.run(client)
+
+        closed = client.rows("scans", "update")[0]
+        assert closed["status"] == db.STATUS_FAILED
+        assert "refresh aborted" in closed["notes"]
+
+    def test_a_sleeve_closed_out_at_a_loss_still_trips_the_breaker(self):
+        # Everything stopped out and closed: no open position, no mark, no
+        # denominator from the open book — and yet this is exactly the moment
+        # §7's four-week entry ban is for.
+        wipeout = position_row(
+            id=9,
+            status="closed",
+            closed_on=(AS_OF - timedelta(days=2)).isoformat(),
+            entry_premium=50.0,
+            exit_premium=5.0,
+            contracts=5,
+            account_equity_at_entry=200_000.0,
+        )
+        client = self.client_with(positions=[wipeout])
+
+        report = self.run(client)
+
+        assert report.positions_count == 0
+        alerts = client.rows("alerts", "insert")[0]
+        breaker = next(row for row in alerts if row["kind"] == "circuit_breaker")
+        assert breaker["position_id"] is None
+        assert breaker["user_id"] == OWNER
+        assert breaker["as_of_date"] == AS_OF.isoformat()
+        assert "$22,500" in breaker["message"]
+
+    def test_a_recovered_sleeve_writes_no_breaker(self):
+        winner = position_row(
+            id=9,
+            status="closed",
+            closed_on=(AS_OF - timedelta(days=2)).isoformat(),
+            entry_premium=20.0,
+            exit_premium=34.0,
+            contracts=2,
+        )
+        client = self.client_with(positions=[winner])
+
+        self.run(client)
+
+        assert client.rows("alerts", "insert") == []
+
+    def test_no_positions_means_no_alerts_and_a_clean_run(self):
+        client = self.client_with()
+
+        report = self.run(client)
+
+        assert report.positions_count == 0
+        assert report.alerts_count == 0
+        assert client.rows("alerts", "insert") == []
+        assert report.status == db.STATUS_OK
+
+
+class TestFullScanExitMonitor:
+    """SPEC.md §3.7: the weekly scan runs §7's weekly rule and only that one."""
+
+    def breaking_frame(self) -> pd.DataFrame:
+        """A long rise, then three weeks down hard enough that the weekly slow
+        %K crosses below 20 on the final completed bar."""
+        values = np.concatenate([np.linspace(100, 200, 455), np.linspace(200, 170, 15)])
+        index = pd.bdate_range(end="2026-08-14", periods=len(values))
+        return pd.DataFrame(
+            {
+                "Open": values,
+                "High": values * 1.01,
+                "Low": values * 0.99,
+                "Close": values,
+                "Volume": np.full(len(values), 2_000_000.0),
+            },
+            index=index,
+        )
+
+    def client_holding(self, **overrides):
+        client = FakeClient()
+        client.select_rows["positions"] = [position_row(**overrides)]
+        client.select_rows["alerts"] = []
+        return client
+
+    def run(self, client, frame, downloader=None):
+        return run_scan.run_full_scan(
+            client,
+            seed=[SeedEntry("AAA", "Alpha", "Information Technology", "Software")],
+            market_cap_fetcher=lambda symbol: 900e9,
+            downloader=downloader or batch_downloader(frame),
+            fundamentals_fetcher=fake_fundamentals,
+            expiries_fetcher=fake_expiries,
+            chain_fetcher=fake_chain,
+            risk_free_fetcher=lambda: 0.04,
+            sleeper=lambda _: None,
+        )
+
+    def test_a_weekly_cross_below_20_writes_an_alert(self):
+        client = self.client_holding()
+
+        self.run(client, self.breaking_frame())
+
+        written = client.rows("alerts", "insert")[0]
+        assert [row["kind"] for row in written] == ["stoch_below_20"]
+        alert = written[0]
+        assert alert["position_id"] == 1
+        assert alert["user_id"] == OWNER
+        assert alert["scan_id"] == 7
+        # The alert speaks for the same week the scan does.
+        assert alert["as_of_date"] == AS_OF.isoformat()
+        assert "crossed below 20" in alert["message"]
+
+    def test_a_healthy_week_writes_nothing(self):
+        client = self.client_holding()
+
+        self.run(client, rising_frame())
+
+        assert client.rows("alerts", "insert") == []
+
+    def test_the_daily_rules_are_left_to_the_refresh(self):
+        # This contract expires in 10 days and the entry premium is far above
+        # any plausible mark — both daily rules would fire. §7 gives them a
+        # daily cadence, and the refresh is where they run.
+        client = self.client_holding(expiry=(AS_OF + timedelta(days=10)).isoformat())
+
+        self.run(client, rising_frame())
+
+        assert client.rows("alerts", "insert") == []
+
+    def test_a_held_name_outside_the_universe_is_priced_but_not_scored(self):
+        # §7's weekly rule still has to run for a position the owner holds, even
+        # if the name has since fallen below the $50B floor — but it must not
+        # reappear on the screener as a result.
+        client = self.client_holding(symbol="HELD")
+
+        report = self.run(client, rising_frame())
+
+        assert report.status == db.STATUS_OK
+        assert report.exit_gaps == ()
+        written = {
+            row["symbol"] for batch in client.rows("scan_results", "upsert") for row in batch
+        }
+        assert written == {"AAA"}
+
+    def test_an_unpriceable_holding_reports_without_blanking_the_screener(self):
+        # The gap goes to the exit code and the notes, never to `status`:
+        # `latestScan` only ever displays an `ok` scan, so failing the run here
+        # would take the public screener down over one position's rule.
+        client = self.client_holding(symbol="ABSENT")
+
+        report = self.run(
+            client,
+            rising_frame(),
+            downloader=drop_symbol(batch_downloader(rising_frame()), "ABSENT"),
+        )
+
+        assert report.status == db.STATUS_OK
+        assert any("stoch_below_20 not evaluated" in gap for gap in report.exit_gaps)
+        assert "Exit evaluation incomplete" in report.notes
+        assert not report.clean
+
+    def test_no_positions_leaves_the_scan_untouched(self):
+        client = FakeClient()
+
+        report = self.run(client, rising_frame())
+
+        assert report.status == db.STATUS_OK
+        assert client.rows("alerts", "insert") == []

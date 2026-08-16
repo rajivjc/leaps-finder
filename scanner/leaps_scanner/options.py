@@ -42,6 +42,11 @@ DAYS_PER_YEAR = 365.0
 # whose nearest usable strike is outside the band contributes no reading.
 ATM_MAX_DISTANCE = 0.20
 
+# Strikes are exact quantities (150, 152.5) that survive a round trip through
+# Postgres `numeric` and yfinance's float64 columns; the tolerance absorbs
+# representation error only, never a neighbouring strike.
+STRIKE_TOLERANCE = 1e-6
+
 RISK_FREE_SYMBOL = "^IRX"
 
 ExpiriesFetcher = Callable[[str], Sequence[date]]
@@ -115,12 +120,56 @@ class OptionsResult:
 
 
 @dataclass(frozen=True)
+class ContractQuote:
+    """A two-sided quote for one already-held contract (SPEC.md §7 premium stop).
+
+    Deliberately thinner than `ContractEconomics`: marking a holding needs a
+    price, not a delta or a breakeven, and recomputing those daily would invite
+    them to disagree with the entry row that actually justified the trade.
+    """
+
+    strike: float
+    bid: float
+    ask: float
+    mid: float
+
+
+@dataclass(frozen=True)
+class QuoteRequest:
+    """One holding to price: `key` is the caller's handle (a position id)."""
+
+    key: int
+    symbol: str
+    expiry: date
+    strike: float
+
+
+@dataclass(frozen=True)
+class QuoteOutcome:
+    """Marks, and the two distinct ways one can be absent.
+
+    `failed` is a chain that never arrived — a fetch problem, retryable.
+    `missing` is a chain that arrived without a usable quote at that strike — a
+    market fact. Both leave the premium stop unevaluated, so both are reported
+    rather than skipped, but only the first says anything about our plumbing.
+    """
+
+    quotes: dict[int, ContractQuote]
+    missing: tuple[int, ...]
+    failed: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class OptionQuery:
     """Per-symbol inputs the options step needs from earlier steps."""
 
     symbol: str
     spot: float
-    dividend_yield: float
+    # Only §5.2's delta needs the carry. `fetch_iv30` reads ATM implied vol
+    # straight off the chain and never computes a delta, so the refresh has no
+    # dividend yield to supply — hence the default rather than a made-up zero at
+    # every call site.
+    dividend_yield: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -128,6 +177,19 @@ class OptionsOutcome:
     """Per-symbol results plus the symbols whose chains never arrived."""
 
     results: dict[str, OptionsResult]
+    failed: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Iv30Outcome:
+    """The refresh's narrower result: IV30 per symbol, plus outright failures.
+
+    A symbol present in `iv30` with a None value had chains that arrived and
+    carried no usable ATM reading — a market fact. A symbol in `failed` never
+    got a chain list at all, and counts against the run's coverage.
+    """
+
+    iv30: dict[str, float | None]
     failed: tuple[str, ...]
 
 
@@ -247,6 +309,87 @@ def select_contract(
     return best
 
 
+def quote_for_strike(calls: pd.DataFrame, strike: float) -> ContractQuote | None:
+    """The quote for one exact strike in an expiry's calls (SPEC.md §7).
+
+    §5's selection scans a chain for the contract nearest 0.70 delta; this is
+    the opposite lookup — the contract is already chosen, and only its current
+    price is in question. It therefore matches the strike exactly (within a
+    float tolerance) and never falls back to a neighbour: a mark taken from a
+    strike the owner does not hold is not a mark, it is a different trade.
+
+    Unlike `select_contract` this accepts `bid == 0`. There, a zero bid means
+    the contract is not enterable and is rightly skipped; here, a bid that has
+    collapsed to nothing is precisely the condition the premium stop exists to
+    catch, and dropping it would make the stop blindest exactly when it matters.
+    The raw bid and ask are carried through to `position_marks` so an alert can
+    be read against the quote it came from. A crossed or absent ask is still
+    rejected as a broken quote.
+    """
+    calls = _frame_or_empty(calls)
+    if calls.empty or "strike" not in calls:
+        return None
+
+    for row in calls.itertuples():
+        row_strike = _finite(row.strike)
+        if row_strike is None or abs(row_strike - strike) > STRIKE_TOLERANCE:
+            continue
+
+        bid = _finite(row.bid)
+        ask = _finite(row.ask)
+        if bid is None or ask is None or ask <= 0 or bid < 0 or ask < bid:
+            continue
+
+        return ContractQuote(strike=row_strike, bid=bid, ask=ask, mid=(bid + ask) / 2.0)
+
+    return None
+
+
+def fetch_contract_quotes(
+    requests: Sequence[QuoteRequest],
+    *,
+    chain_fetcher: ChainFetcher,
+    throttle: Throttle | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    rng: random.Random | None = None,
+) -> QuoteOutcome:
+    """Price every held contract, one chain fetch per distinct (symbol, expiry).
+
+    Two positions in the same contract — a scale-in — cost one request, not two.
+    """
+    limiter = throttle if throttle is not None else Throttle(sleeper=sleeper)
+    chains: dict[tuple[str, date], OptionChain | None] = {}
+
+    quotes: dict[int, ContractQuote] = {}
+    missing: list[int] = []
+    failed: list[int] = []
+
+    for request in requests:
+        cache_key = (request.symbol, request.expiry)
+        if cache_key not in chains:
+            chains[cache_key] = retry_fetch(
+                lambda request=request: chain_fetcher(request.symbol, request.expiry),
+                describe=f"held chain {request.symbol} {request.expiry}",
+                throttle=limiter,
+                sleeper=sleeper,
+                rng=rng,
+                is_empty=lambda chain: chain.is_empty,
+            )
+
+        chain = chains[cache_key]
+        if chain is None:
+            failed.append(request.key)
+            continue
+
+        quote = quote_for_strike(chain.calls, request.strike)
+        if quote is None:
+            missing.append(request.key)
+        else:
+            quotes[request.key] = quote
+
+    return QuoteOutcome(quotes=quotes, missing=tuple(missing), failed=tuple(failed))
+
+
 def atm_iv(chain: OptionChain, spot: float) -> float | None:
     """ATM IV for one expiry: mean of call and put IV at the strike nearest
     spot (§3.5). One usable side is accepted; none means no reading.
@@ -321,6 +464,78 @@ def realized_vol_20d(close: pd.Series) -> float | None:
     return float(returns.std(ddof=1) * math.sqrt(TRADING_DAYS_PER_YEAR))
 
 
+class _ChainCache:
+    """One symbol's chains, fetched at most once per expiry.
+
+    The LEAP expiry can double as the nearest IV30 term on a sparse chain, and
+    two positions can share a contract, so the memo is not an optimisation
+    detail — it is what keeps the request count honest against the ≤5 req/s
+    budget.
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        *,
+        chain_fetcher: ChainFetcher,
+        throttle: Throttle,
+        sleeper: Callable[[float], None],
+        rng: random.Random | None,
+    ) -> None:
+        self._symbol = symbol
+        self._chain_fetcher = chain_fetcher
+        self._throttle = throttle
+        self._sleeper = sleeper
+        self._rng = rng
+        self._chains: dict[date, OptionChain | None] = {}
+
+    def get(self, expiry: date) -> OptionChain | None:
+        if expiry not in self._chains:
+            self._chains[expiry] = retry_fetch(
+                lambda: self._chain_fetcher(self._symbol, expiry),
+                describe=f"option chain {self._symbol} {expiry}",
+                throttle=self._throttle,
+                sleeper=self._sleeper,
+                rng=self._rng,
+                is_empty=lambda chain: chain.is_empty,
+            )
+        return self._chains[expiry]
+
+
+def _fetch_expiries(
+    symbol: str,
+    *,
+    expiries_fetcher: ExpiriesFetcher,
+    throttle: Throttle,
+    sleeper: Callable[[float], None],
+    rng: random.Random | None,
+) -> list[date] | None:
+    return retry_fetch(
+        lambda: list(expiries_fetcher(symbol)),
+        describe=f"option expiries {symbol}",
+        throttle=throttle,
+        sleeper=sleeper,
+        rng=rng,
+        is_empty=lambda listed: len(listed) == 0,
+    )
+
+
+def _iv30_from_chains(
+    expiries: Sequence[date], *, spot: float, today: date, chains: _ChainCache
+) -> float | None:
+    """§3.5's IV30 for one symbol: ATM readings on the expiries bracketing 30
+    days, interpolated."""
+    terms = []
+    for expiry in iv30_expiries(expiries, today):
+        chain = chains.get(expiry)
+        if chain is None:
+            continue
+        reading = atm_iv(chain, spot)
+        if reading is not None:
+            terms.append(((expiry - today).days, reading))
+    return interpolate_iv30(terms)
+
+
 def evaluate_symbol_options(
     query: OptionQuery,
     *,
@@ -336,48 +551,23 @@ def evaluate_symbol_options(
 
     The 30-day chains are fetched first and their IV30 survives a failed LEAP
     fetch (`chain_failed=True`): losing the contract must not also stall the
-    symbol's §6 snapshot accrual. Chains are memoized per expiry — the LEAP
-    expiry can double as the nearest IV30 term on sparse chains.
+    symbol's §6 snapshot accrual.
     """
-    chains: dict[date, OptionChain | None] = {}
-
-    def fetch_chain(expiry: date) -> OptionChain | None:
-        if expiry not in chains:
-            chains[expiry] = retry_fetch(
-                lambda: chain_fetcher(query.symbol, expiry),
-                describe=f"option chain {query.symbol} {expiry}",
-                throttle=throttle,
-                sleeper=sleeper,
-                rng=rng,
-                is_empty=lambda chain: chain.is_empty,
-            )
-        return chains[expiry]
-
-    expiries = retry_fetch(
-        lambda: list(expiries_fetcher(query.symbol)),
-        describe=f"option expiries {query.symbol}",
-        throttle=throttle,
-        sleeper=sleeper,
-        rng=rng,
-        is_empty=lambda listed: len(listed) == 0,
+    chains = _ChainCache(
+        query.symbol, chain_fetcher=chain_fetcher, throttle=throttle, sleeper=sleeper, rng=rng
+    )
+    expiries = _fetch_expiries(
+        query.symbol, expiries_fetcher=expiries_fetcher, throttle=throttle, sleeper=sleeper, rng=rng
     )
     if expiries is None:
         return None
 
-    terms = []
-    for expiry in iv30_expiries(expiries, today):
-        chain = fetch_chain(expiry)
-        if chain is None:
-            continue
-        reading = atm_iv(chain, query.spot)
-        if reading is not None:
-            terms.append(((expiry - today).days, reading))
-    iv30 = interpolate_iv30(terms)
+    iv30 = _iv30_from_chains(expiries, spot=query.spot, today=today, chains=chains)
 
     contract = None
     choice = select_leap_expiry(expiries, today)
     if choice is not None:
-        chain = fetch_chain(choice.expiry)
+        chain = chains.get(choice.expiry)
         if chain is None:
             return OptionsResult(contract=None, iv30=iv30, chain_failed=True)
         contract = select_contract(
@@ -390,6 +580,50 @@ def evaluate_symbol_options(
         )
 
     return OptionsResult(contract=contract, iv30=iv30)
+
+
+def fetch_iv30(
+    queries: Sequence[OptionQuery],
+    *,
+    today: date,
+    expiries_fetcher: ExpiriesFetcher,
+    chain_fetcher: ChainFetcher,
+    throttle: Throttle | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    rng: random.Random | None = None,
+) -> Iv30Outcome:
+    """IV30 only, for the daily refresh (§3's `refresh`: "appends iv_snapshots").
+
+    The refresh does not rescore, so it has no use for the 0.70-delta contract
+    and no reason to pay for the LEAP chain that would price it — roughly a
+    third of the option requests a full scan makes. What it does need is the
+    daily snapshot cadence that §6's IV-rank bootstrap is defined on: 120
+    snapshots is six months at five a week, and better than two years at one.
+    """
+    limiter = throttle if throttle is not None else Throttle(sleeper=sleeper)
+
+    iv30: dict[str, float | None] = {}
+    failed: list[str] = []
+    for query in queries:
+        expiries = _fetch_expiries(
+            query.symbol,
+            expiries_fetcher=expiries_fetcher,
+            throttle=limiter,
+            sleeper=sleeper,
+            rng=rng,
+        )
+        if expiries is None:
+            failed.append(query.symbol)
+            continue
+
+        chains = _ChainCache(
+            query.symbol, chain_fetcher=chain_fetcher, throttle=limiter, sleeper=sleeper, rng=rng
+        )
+        iv30[query.symbol] = _iv30_from_chains(
+            expiries, spot=query.spot, today=today, chains=chains
+        )
+
+    return Iv30Outcome(iv30=iv30, failed=tuple(failed))
 
 
 def fetch_options(

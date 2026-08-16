@@ -1,0 +1,54 @@
+name: Daily refresh
+
+# 22:30 UTC on weekdays — roughly two hours after the 20:00/21:00 UTC US close,
+# so quotes have settled (SPEC.md §9).
+#
+# §9 writes the day range as `2-6` and annotates it "Tue–Sat UTC = Mon–Fri US
+# close". That annotation only holds for a job scheduled after UTC midnight; at
+# 22:30 there is no date rollover, so 22:30 UTC Tuesday is 18:30 ET Tuesday and
+# `2-6` would in fact cover Tue–Fri's closes plus a Saturday with no session,
+# missing Monday's entirely. `1-5` is what the annotation describes, and it is
+# what a daily premium stop needs — a Monday collapse otherwise goes unseen
+# until Tuesday evening. Deviation from the literal cron string agreed with RC.
+on:
+  schedule:
+    - cron: "30 22 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Refresh quotes, IV snapshots and exits
+    runs-on: ubuntu-latest
+    # Well under the weekly scan's 45: the refresh skips fundamentals and the
+    # LEAP chains entirely (no rescoring), leaving quotes, the near-dated
+    # chains behind IV30, and a handful of held contracts to mark.
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: scanner
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install
+        run: pip install -e .
+
+      # Exits non-zero when the refresh is recorded as failed — including when
+      # any of §7's exit rules could not be evaluated for an open position. A
+      # missed stop must show up red here, not be inferred from silence.
+      #
+      # This job is also the Supabase keep-alive §9 asks for: it writes to the
+      # project every weekday, which is what stops a free-tier project pausing.
+      - name: Run daily refresh
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: python -m leaps_scanner.run_scan refresh

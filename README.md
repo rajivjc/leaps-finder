@@ -93,7 +93,8 @@ Built milestone by milestone against [SPEC.md §11](SPEC.md).
 - [x] **M2 Scanner core** — universe, prices, indicators, `scan_results` writes, weekly cron
 - [x] **M3 Options + scoring** — chain selection, Black-Scholes delta, IV snapshots, presets
 - [x] **M4 Frontend** — screener, ticker detail, compare, about; `weekly_bars` chart series
-- [ ] **M5 Risk** — auth, positions, size calculator, exit monitor and alerts
+- [x] **M5 Risk** — magic-link auth, positions CRUD, persisted size calculator, §7's exit
+      monitor and alerts, daily refresh job
 - [ ] **M6 Polish** — deploy, screenshots, badges
 
 ## Disclaimer

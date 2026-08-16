@@ -9,7 +9,7 @@ import { CompositeScore, FactorBars } from "@/components/ScoreBar";
 import { SizeCalculator } from "@/components/SizeCalculator";
 import { StochasticPanel } from "@/components/StochasticPanel";
 import { EM_DASH, fmtCompactUsd, fmtDate, fmtPercent, fmtUsd } from "@/lib/format";
-import { loadTicker } from "@/lib/queries";
+import { loadOwnerEquity, loadTicker } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 
@@ -34,7 +34,7 @@ function Panel({
 export default async function TickerPage({ params }: PageProps<"/t/[symbol]">) {
   const { symbol } = await params;
   const requested = decodeURIComponent(symbol).toUpperCase();
-  const loaded = await loadTicker(requested);
+  const [loaded, owner] = await Promise.all([loadTicker(requested), loadOwnerEquity()]);
 
   if (loaded.state === "unconfigured") {
     return <Notice title="Supabase is not configured">No scan data is readable.</Notice>;
@@ -123,7 +123,12 @@ export default async function TickerPage({ params }: PageProps<"/t/[symbol]">) {
         </Panel>
 
         <Panel title="Position size">
-          <SizeCalculator mid={row.opt_mid} symbol={row.symbol} />
+          <SizeCalculator
+            mid={row.opt_mid}
+            symbol={row.symbol}
+            savedEquity={owner.equity}
+            signedIn={owner.signedIn}
+          />
         </Panel>
       </div>
     </div>

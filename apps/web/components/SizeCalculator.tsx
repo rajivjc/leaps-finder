@@ -1,21 +1,27 @@
 "use client";
 
 /**
- * Position sizing (SPEC.md §7), client-side only.
+ * Position sizing (SPEC.md §7).
  *
  *     max_premium_dollars = 0.03 · equity
  *     max_contracts       = floor(max_premium_dollars / (mid · 100))
  *
- * Nothing here is persisted. §7 has the equity saved per user, but that needs
- * auth and the `positions` table, which are M5 — so this milestone does the
- * arithmetic and stops there rather than half-implementing storage. The sleeve
- * meters (15% exposure cap, 2-per-sector, 5 positions) need open positions to
- * measure, so they land with M5 too; the caps are stated here so the number
- * this calculator gives is read in context.
+ * §7 has the equity persisted per user, and as of M5 it is — in
+ * `user_settings` (migration 0004). This page is public, though, so the
+ * calculator has to work for a signed-out visitor too: it seeds from the saved
+ * figure when there is a session, falls back to a local, unsaved value when
+ * there is not, and says which of the two it is doing rather than leaving the
+ * reader to guess whether their number was kept.
+ *
+ * The sleeve meters (15% exposure, 2 per sector, 5 positions) need open
+ * positions to measure and live on /positions; the caps are named here so the
+ * number this calculator gives is read in context.
  */
 
 import { useState } from "react";
 
+import { saveEquity } from "@/app/positions/actions";
+import { ActionForm, SubmitButton } from "@/components/ActionForm";
 import { fmtInteger, fmtPercent, fmtUsd } from "@/lib/format";
 import {
   MAX_PER_SECTOR,
@@ -25,8 +31,19 @@ import {
   positionSize,
 } from "@/lib/metrics";
 
-export function SizeCalculator({ mid, symbol }: { mid: number | null; symbol: string }) {
-  const [equity, setEquity] = useState("");
+export function SizeCalculator({
+  mid,
+  symbol,
+  savedEquity = null,
+  signedIn = false,
+}: {
+  mid: number | null;
+  symbol: string;
+  /** The owner's persisted equity, when there is a session. */
+  savedEquity?: number | null;
+  signedIn?: boolean;
+}) {
+  const [equity, setEquity] = useState(savedEquity === null ? "" : String(savedEquity));
 
   const parsed = equity.trim() === "" ? null : Number(equity);
   const size = positionSize(parsed, mid);
@@ -45,6 +62,19 @@ export function SizeCalculator({ mid, symbol }: { mid: number | null; symbol: st
           className="w-full rounded border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-sm tabular-nums"
         />
       </label>
+
+      {signedIn && (
+        <ActionForm action={saveEquity}>
+          {(pending) => (
+            <>
+              <input type="hidden" name="account_equity" value={equity} />
+              <SubmitButton pending={pending} variant="quiet">
+                {parsed !== null && parsed === savedEquity ? "Saved" : "Save as my equity"}
+              </SubmitButton>
+            </>
+          )}
+        </ActionForm>
+      )}
 
       {mid === null ? (
         <p className="text-xs leading-relaxed text-[var(--muted)]">
@@ -94,9 +124,15 @@ export function SizeCalculator({ mid, symbol }: { mid: number | null; symbol: st
 
       <p className="text-[10px] leading-relaxed text-[var(--muted)]">
         §7 also caps the sleeve at {fmtPercent(SLEEVE_EXPOSURE_CAP, 0)} of equity in open premium,{" "}
-        {MAX_PER_SECTOR} positions per sector and {MAX_POSITIONS} positions overall. Those are
-        measured against open positions, which arrive with the positions page. Nothing entered here
-        is saved.
+        {MAX_PER_SECTOR} positions per sector and {MAX_POSITIONS} positions overall — measured
+        against your open positions on the{" "}
+        <a href="/positions" className="underline">
+          positions page
+        </a>
+        .{" "}
+        {signedIn
+          ? "Equity is saved to your account."
+          : "Nothing entered here is saved; sign in to keep it."}
       </p>
     </div>
   );

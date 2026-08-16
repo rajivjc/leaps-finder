@@ -372,3 +372,161 @@ class TestEvaluateSymbolOptions:
         # means it is not fetched a third time.
         assert result.contract is not None
         assert len(attempts) == 2
+
+
+class TestQuoteForStrike:
+    """§7's premium stop prices a contract the owner already holds, which is the
+    opposite lookup from §5's selection."""
+
+    def test_it_returns_the_quote_at_the_exact_strike(self):
+        calls = calls_frame(
+            [
+                [175.0, 20.0, 20.4, 500, 0.30],
+                [180.0, 16.0, 16.4, 900, 0.29],
+                [185.0, 12.0, 12.4, 300, 0.28],
+            ]
+        )
+
+        quote = options.quote_for_strike(calls, 180.0)
+
+        assert quote is not None
+        assert quote.strike == 180.0
+        assert quote.mid == pytest.approx(16.2)
+
+    def test_it_never_falls_back_to_a_neighbouring_strike(self):
+        # A mark taken from a strike the owner does not hold is a different
+        # trade, not an approximation of theirs.
+        calls = calls_frame([[175.0, 20.0, 20.4, 500, 0.30], [185.0, 12.0, 12.4, 300, 0.28]])
+
+        assert options.quote_for_strike(calls, 180.0) is None
+
+    def test_a_collapsed_bid_still_marks(self):
+        # Unlike `select_contract`, which needs bid > 0 for an enterable
+        # contract: a bid that has gone to nothing is exactly what the stop is
+        # watching for, and skipping it would blind the rule when it matters.
+        calls = calls_frame([[180.0, 0.0, 0.10, 900, 0.29]])
+
+        quote = options.quote_for_strike(calls, 180.0)
+
+        assert quote is not None
+        assert quote.mid == pytest.approx(0.05)
+
+    def test_a_crossed_market_is_rejected(self):
+        calls = calls_frame([[180.0, 16.4, 16.0, 900, 0.29]])
+
+        assert options.quote_for_strike(calls, 180.0) is None
+
+    def test_an_absent_ask_is_rejected(self):
+        calls = calls_frame([[180.0, 16.0, 0.0, 900, 0.29]])
+
+        assert options.quote_for_strike(calls, 180.0) is None
+
+    def test_junk_cells_cost_one_contract_not_the_run(self):
+        calls = calls_frame([[180.0, None, "n/a", 900, 0.29]])
+
+        assert options.quote_for_strike(calls, 180.0) is None
+
+    def test_an_empty_chain_yields_nothing(self):
+        assert options.quote_for_strike(pd.DataFrame(), 180.0) is None
+
+    def test_float_representation_error_still_matches(self):
+        calls = calls_frame([[182.5, 14.0, 14.4, 100, 0.29]])
+
+        assert options.quote_for_strike(calls, 182.5000000001) is not None
+
+
+class TestFetchContractQuotes:
+    def _chain(self, rows):
+        return OptionChain(calls=calls_frame(rows), puts=pd.DataFrame())
+
+    def test_one_request_per_distinct_contract_expiry(self):
+        seen = []
+
+        def fetcher(symbol, expiry):
+            seen.append((symbol, expiry))
+            return self._chain([[180.0, 16.0, 16.4, 900, 0.29]])
+
+        expiry = date(2027, 6, 18)
+        outcome = options.fetch_contract_quotes(
+            [
+                options.QuoteRequest(key=1, symbol="AAPL", expiry=expiry, strike=180.0),
+                options.QuoteRequest(key=2, symbol="AAPL", expiry=expiry, strike=180.0),
+            ],
+            chain_fetcher=fetcher,
+            throttle=instant_throttle(),
+            sleeper=lambda _: None,
+        )
+
+        # A scale-in into the same contract costs one fetch, not two.
+        assert seen == [("AAPL", expiry)]
+        assert set(outcome.quotes) == {1, 2}
+
+    def test_a_missing_strike_is_distinguished_from_a_failed_fetch(self):
+        outcome = options.fetch_contract_quotes(
+            [options.QuoteRequest(key=1, symbol="AAPL", expiry=date(2027, 6, 18), strike=999.0)],
+            chain_fetcher=lambda symbol, expiry: self._chain([[180.0, 16.0, 16.4, 900, 0.29]]),
+            throttle=instant_throttle(),
+            sleeper=lambda _: None,
+        )
+
+        assert outcome.missing == (1,)
+        assert outcome.failed == ()
+
+    def test_an_empty_chain_counts_as_a_fetch_failure(self):
+        # yfinance reports failure as an empty payload rather than an exception,
+        # so emptiness is what the retry loop watches.
+        outcome = options.fetch_contract_quotes(
+            [options.QuoteRequest(key=1, symbol="AAPL", expiry=date(2027, 6, 18), strike=180.0)],
+            chain_fetcher=lambda symbol, expiry: OptionChain(
+                calls=pd.DataFrame(), puts=pd.DataFrame()
+            ),
+            throttle=instant_throttle(),
+            sleeper=lambda _: None,
+        )
+
+        assert outcome.failed == (1,)
+        assert outcome.missing == ()
+
+
+class TestFetchIv30:
+    def test_it_reads_iv30_without_touching_the_leap_chain(self):
+        fetched = []
+
+        def chain_fetcher(symbol, expiry):
+            fetched.append(expiry)
+            return OptionChain(
+                calls=calls_frame([[100.0, 5.0, 5.2, 100, 0.25]]),
+                puts=calls_frame([[100.0, 4.0, 4.2, 100, 0.27]]),
+            )
+
+        outcome = options.fetch_iv30(
+            [OptionQuery(symbol="AAPL", spot=100.0)],
+            today=date(2026, 8, 14),
+            expiries_fetcher=lambda symbol: [
+                date(2026, 9, 4),
+                date(2026, 10, 2),
+                date(2027, 8, 20),
+            ],
+            chain_fetcher=chain_fetcher,
+            throttle=instant_throttle(),
+            sleeper=lambda _: None,
+        )
+
+        # Only the two expiries bracketing 30 days; the 371-day LEAP is not
+        # fetched because the refresh does not rescore.
+        assert fetched == [date(2026, 9, 4), date(2026, 10, 2)]
+        assert outcome.failed == ()
+        assert outcome.iv30["AAPL"] == pytest.approx(0.26)
+
+    def test_a_symbol_with_no_expiries_is_reported_as_failed(self):
+        outcome = options.fetch_iv30(
+            [OptionQuery(symbol="AAPL", spot=100.0)],
+            today=date(2026, 8, 14),
+            expiries_fetcher=lambda symbol: [],
+            chain_fetcher=lambda symbol, expiry: OptionChain(pd.DataFrame(), pd.DataFrame()),
+            throttle=instant_throttle(),
+            sleeper=lambda _: None,
+        )
+
+        assert outcome.failed == ("AAPL",)
+        assert "AAPL" not in outcome.iv30
