@@ -8,7 +8,7 @@ from leaps_scanner.backtest.membership import (
     Membership,
     MembershipSpan,
     load_spans,
-    membership_path,
+    membership_text,
     normalize_symbol,
 )
 
@@ -108,9 +108,19 @@ class TestValidation:
         with pytest.raises(ValueError, match="overlapping"):
             load_spans(write_csv(tmp_path, "ABC,2020-01-01,\nABC,2021-01-01,\n"))
 
-    def test_a_bad_date_names_the_row(self, tmp_path):
-        with pytest.raises(ValueError, match="row 2"):
+    def test_a_bad_date_names_the_line_the_file_actually_has(self, tmp_path):
+        # The fixture opens with one comment line, so the bad row is line 3 —
+        # not row 2. The shipped file has 38 header lines, where counting rows
+        # after stripping comments would point 38 lines away from the problem.
+        with pytest.raises(ValueError, match="line 3"):
             load_spans(write_csv(tmp_path, "ABC,not-a-date,\n"))
+
+    def test_the_reported_line_survives_a_long_comment_header(self, tmp_path):
+        path = tmp_path / "membership.csv"
+        path.write_text("#\n" * 20 + "symbol,added,removed\nAAA,2020-01-01,\nBBB,nope,\n")
+
+        with pytest.raises(ValueError, match="line 23"):
+            load_spans(path)
 
     def test_a_missing_added_date_is_rejected(self, tmp_path):
         with pytest.raises(ValueError, match="no added date"):
@@ -165,8 +175,7 @@ class TestShippedFile:
         assert len(spans) > 500
 
     def test_it_records_its_source_and_retrieval_date(self):
-        header = membership_path().read_text(encoding="utf-8").splitlines()
-        comments = [line for line in header if line.startswith("#")]
+        comments = [line for line in membership_text().splitlines() if line.startswith("#")]
 
         assert any("wikipedia.org" in line for line in comments)
         assert any("Retrieved:" in line for line in comments)

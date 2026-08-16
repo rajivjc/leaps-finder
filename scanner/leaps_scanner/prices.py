@@ -35,6 +35,8 @@ OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 Request = object
 Downloader = Callable[[Sequence[str], Request], pd.DataFrame]
 Splitter = Callable[[pd.DataFrame, Sequence[str]], dict[str, pd.DataFrame]]
+# Called with each batch's frames and the symbols it asked for, as it lands.
+BatchCallback = Callable[[dict[str, pd.DataFrame], Sequence[str]], None]
 
 
 class Throttle:
@@ -165,7 +167,7 @@ def fetch_batched(
     sleeper: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
     max_retries: int = MAX_RETRIES,
-    on_batch: Callable[[dict[str, pd.DataFrame], Sequence[str]], None] | None = None,
+    on_batch: BatchCallback | None = None,
 ) -> FetchOutcome:
     """Fetch history for every symbol, batched and throttled.
 

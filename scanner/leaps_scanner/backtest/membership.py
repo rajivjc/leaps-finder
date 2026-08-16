@@ -102,40 +102,59 @@ class Membership:
         return {symbol: tuple(fridays) for symbol, fridays in sorted(weeks.items())}
 
 
-def membership_path() -> Path:
+def membership_text() -> str:
+    """The bundled CSV's contents.
+
+    Reads through the resource itself rather than handing back a filesystem
+    path: `resources.as_file` only materializes a real file for the duration of
+    its context, so a path returned out of one points at a deleted temp file
+    under any loader that does not serve the package straight off disk.
+    """
     source = resources.files("leaps_scanner.backtest").joinpath(MEMBERSHIP_FILE)
-    with resources.as_file(source) as path:
-        return Path(path)
+    return source.read_text(encoding="utf-8")
 
 
 def load_spans(path: Path | None = None) -> list[MembershipSpan]:
     """Read the membership CSV, validating what a hand-compiled file can get wrong.
 
-    Comment lines carry the provenance §2.1 requires and are skipped here.
+    Comment lines carry the provenance §2.1 requires and are skipped here, but
+    their line numbers are kept so an error points at the line the file actually
+    has — the shipped file opens with nearly forty lines of header, and a row
+    number counted after stripping them sends the reader to the wrong place.
+
     Rows are validated rather than trusted: a span that ends before it starts, or
     two overlapping spans for one symbol, would silently double-count member-weeks
     and inflate the coverage denominator, so both are refused outright.
     """
-    target = path if path is not None else membership_path()
-    with target.open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.DictReader(line for line in handle if not line.startswith("#")))
+    name = path.name if path is not None else Path(MEMBERSHIP_FILE).name
+    text = path.read_text(encoding="utf-8") if path is not None else membership_text()
+
+    numbered = [
+        (number, line)
+        for number, line in enumerate(text.splitlines(), start=1)
+        if not line.startswith("#")
+    ]
+    rows = list(csv.DictReader(line for _, line in numbered))
+    # The header consumes the first surviving line; the rest map one-to-one onto
+    # data rows (no quoted newlines in this file).
+    line_numbers = [number for number, _ in numbered[1:]]
 
     spans: list[MembershipSpan] = []
-    for number, row in enumerate(rows, start=2):
+    for row, number in zip(rows, line_numbers, strict=False):
         symbol = normalize_symbol(row.get("symbol") or "")
         if not symbol:
-            raise ValueError(f"{target.name} row {number}: missing symbol")
+            raise ValueError(f"{name} line {number}: missing symbol")
 
-        added = _parse_date(row.get("added"), target.name, number, "added")
+        added = _parse_date(row.get("added"), name, number, "added")
         if added is None:
-            raise ValueError(f"{target.name} row {number}: {symbol} has no added date")
-        removed = _parse_date(row.get("removed"), target.name, number, "removed")
+            raise ValueError(f"{name} line {number}: {symbol} has no added date")
+        removed = _parse_date(row.get("removed"), name, number, "removed")
 
         if removed is not None and removed < added:
-            raise ValueError(f"{target.name} row {number}: {symbol} removed {removed} < added")
+            raise ValueError(f"{name} line {number}: {symbol} removed {removed} < added")
         spans.append(MembershipSpan(symbol=symbol, added=added, removed=removed))
 
-    _reject_overlaps(spans, target.name)
+    _reject_overlaps(spans, name)
     spans.sort(key=lambda span: (span.symbol, span.added))
     return spans
 
@@ -147,7 +166,7 @@ def _parse_date(value: str | None, filename: str, number: int, column: str) -> d
     try:
         return date.fromisoformat(text)
     except ValueError as exc:
-        raise ValueError(f"{filename} row {number}: bad {column} date {text!r}") from exc
+        raise ValueError(f"{filename} line {number}: bad {column} date {text!r}") from exc
 
 
 def _reject_overlaps(spans: Iterable[MembershipSpan], filename: str) -> None:

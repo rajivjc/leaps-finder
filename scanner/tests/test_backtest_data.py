@@ -56,11 +56,21 @@ class TestWindow:
         assert (window.start - window.fetch_start).days == 550
         assert window.fetch_start == date(2015, 2, 11)
 
-    def test_a_leap_day_window_end_steps_back_rather_than_into_march(self):
+    def test_an_early_march_window_end_is_unremarkable(self):
         window = data.evaluation_window(date(2024, 3, 2))
 
         assert window.end == date(2024, 3, 1)
         assert window.start == date(2014, 3, 1)
+
+    def test_a_leap_day_window_end_steps_back_to_the_28th(self):
+        # Saturday 2008-03-01 closes the week ending Friday 2008-02-29, and 1998
+        # is not a leap year — the one case where the ten-year subtraction has
+        # no same-date answer. It must land on 02-28, not roll into March.
+        window = data.evaluation_window(date(2008, 3, 1))
+
+        assert window.end == date(2008, 2, 29)
+        assert window.start == date(1998, 2, 28)
+        assert (window.start - window.fetch_start).days == 550
 
     def test_week_endings_are_every_friday_in_the_range(self):
         fridays = data.week_endings(date(2020, 1, 1), date(2020, 1, 31))
@@ -232,6 +242,27 @@ class TestFillCache:
         assert cache.load("AAA") is not None
         assert cache.read_manifest()["symbols"]["AAA"]["rows"] == 5
 
+    def test_an_empty_result_is_asked_again_on_the_next_run(self, tmp_path):
+        # yfinance reports rate limiting by returning nothing, so a symbol
+        # recorded with no rows must not be trusted as "delisted" — otherwise a
+        # transient outage becomes a permanent hole that §2.4's coverage ratio
+        # blames on survivorship.
+        healthy = [False]
+
+        def downloader(symbols, request):
+            return frame(list(symbols)) if healthy[0] else pd.DataFrame()
+
+        cache = data.PriceCache(tmp_path)
+        self.fill(cache, ["AAA"], downloader)
+        assert cache.load("AAA") is None
+
+        healthy[0] = True
+        summary = self.fill(cache, ["AAA"], downloader)
+
+        assert summary.fetched == ("AAA",)
+        assert cache.load("AAA") is not None
+        assert cache.read_manifest()["failed"] == []
+
     def test_a_symbol_that_recovers_stops_being_listed_as_failed(self, tmp_path):
         # Yahoo goes quiet for a name and later returns it; the cache must not
         # remember it as dead once it has data.
@@ -282,6 +313,100 @@ class TestFillCache:
 
         assert summary.fetched == ("AAA",)
         assert not summary.rates_ok
+
+
+class TestWeeklyRerun:
+    """A run a week later must top the cache up, not rebuild it (§3.4)."""
+
+    def fill(self, cache, symbols, downloader, run_date, window, **kwargs):
+        return data.fill_cache(
+            symbols,
+            window,
+            cache,
+            run_date=run_date,
+            downloader=downloader,
+            throttle=no_throttle(),
+            sleeper=lambda _: None,
+            rng=random.Random(0),
+            **kwargs,
+        )
+
+    def recorder(self):
+        asked = []
+
+        def downloader(symbols, request):
+            asked.append((tuple(symbols), request.start, request.end))
+            sessions = len(pd.bdate_range(start=request.start, end=request.end))
+            return frame(list(symbols), sessions=sessions, start=request.start.isoformat())
+
+        return downloader, asked
+
+    def test_only_the_missing_tail_is_fetched_when_the_window_advances(self, tmp_path):
+        # The cold fetch is 30-45 minutes; five new sessions must not cost it
+        # again. Without this the cache is useless outside a single week.
+        downloader, asked = self.recorder()
+        cache = data.PriceCache(tmp_path)
+        first = data.evaluation_window(date(2026, 8, 16))
+        second = data.evaluation_window(date(2026, 8, 23))
+
+        self.fill(cache, ["AAA", "BBB"], downloader, date(2026, 8, 16), first)
+        summary = self.fill(cache, ["AAA", "BBB"], downloader, date(2026, 8, 23), second)
+
+        assert summary.fetched == ()  # nothing needed the full 11.5-year range
+        assert summary.topped_up == ("AAA", "BBB")
+        tail = [call for call in asked if call[0] == ("AAA", "BBB")][-1]
+        assert tail[1] >= first.end  # starts at the cached edge, not in 2015
+        assert tail[2] == second.end
+
+    def test_a_top_up_extends_the_cached_series_rather_than_replacing_it(self, tmp_path):
+        downloader, _ = self.recorder()
+        cache = data.PriceCache(tmp_path)
+        first = data.evaluation_window(date(2026, 8, 16))
+        second = data.evaluation_window(date(2026, 8, 23))
+
+        self.fill(cache, ["AAA"], downloader, date(2026, 8, 16), first)
+        before = cache.load("AAA")
+        self.fill(cache, ["AAA"], downloader, date(2026, 8, 23), second)
+        after = cache.load("AAA")
+
+        assert after.index[0] == before.index[0]  # the warm-up history survived
+        assert after.index[-1] > before.index[-1]
+        assert after.index.is_unique  # overlapping sessions resolved, not duplicated
+        assert after.index.is_monotonic_increasing
+
+    def test_an_unchanged_window_reuses_everything(self, tmp_path):
+        downloader, asked = self.recorder()
+        cache = data.PriceCache(tmp_path)
+        window = data.evaluation_window(date(2026, 8, 16))
+
+        self.fill(cache, ["AAA"], downloader, date(2026, 8, 16), window)
+        summary = self.fill(cache, ["AAA"], downloader, date(2026, 8, 16), window)
+
+        assert summary.reused == ("AAA",)
+        assert [call for call in asked if call[0] == ("AAA",)] == asked[:1]
+
+    def test_a_symbol_that_stopped_trading_is_not_re_asked_every_run(self, tmp_path):
+        # A name delisted mid-window has no tail to give. Recording that we asked
+        # over the new range stops it being chased again next week, while a
+        # symbol with no rows at all is still retried (that is the ambiguous one).
+        cache = data.PriceCache(tmp_path)
+        first = data.evaluation_window(date(2026, 8, 16))
+        second = data.evaluation_window(date(2026, 8, 23))
+
+        def downloader(symbols, request):
+            if request.start >= first.end:  # the tail request: nothing left
+                return pd.DataFrame()
+            sessions = len(pd.bdate_range(start=request.start, end=request.end))
+            return frame(list(symbols), sessions=sessions, start=request.start.isoformat())
+
+        self.fill(cache, ["AAA"], downloader, date(2026, 8, 16), first)
+        rows = len(cache.load("AAA"))
+        self.fill(cache, ["AAA"], downloader, date(2026, 8, 23), second)
+
+        assert cache.read_manifest()["failed"] == []  # an empty tail is not a failure
+        assert len(cache.load("AAA")) == rows  # and it did not lose its history
+        summary = self.fill(cache, ["AAA"], downloader, date(2026, 8, 23), second)
+        assert summary.reused == ("AAA",)
 
 
 class TestCoverage:

@@ -235,6 +235,94 @@ class PriceCache:
             and date.fromisoformat(entry["requested_end"]) >= wanted.end
         )
 
+    def merge(self, symbol: str, frame: pd.DataFrame) -> None:
+        """Append a freshly-fetched tail to whatever is already cached.
+
+        Overlapping sessions resolve to the newer copy, which is what makes it
+        safe for a top-up request to start a day early rather than trying to
+        land exactly on the boundary.
+        """
+        existing = self.load(symbol)
+        if existing is None:
+            self.store(symbol, frame)
+            return
+
+        price_columns = [column for column in PRICE_COLUMNS if column in frame.columns]
+        combined = pd.concat([existing, frame[price_columns]])
+        combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        combined.to_parquet(self._path(self.prices_dir, symbol))
+
+        if DIVIDEND_COLUMN in frame.columns:
+            paid = frame.loc[frame[DIVIDEND_COLUMN] > 0, [DIVIDEND_COLUMN]]
+            held = self.load_dividends(symbol)
+            merged = paid if held is None else pd.concat([held, paid])
+            merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+            merged.to_parquet(self._path(self.dividends_dir, symbol))
+
+
+@dataclass(frozen=True)
+class FetchPlan:
+    """Which symbols need the whole range, which need only the missing tail."""
+
+    full: tuple[str, ...]
+    tail: tuple[str, ...]
+    tail_range: DateRange | None
+    reused: tuple[str, ...]
+
+
+def plan_fetch(
+    manifest: dict,
+    symbols: Sequence[str],
+    wanted: DateRange,
+    *,
+    refresh: bool = False,
+) -> FetchPlan:
+    """Decide what actually has to go over the wire.
+
+    Two rules earn their keep here:
+
+    * **An empty result is not proof of absence.** A symbol recorded with no
+      rows is asked again rather than trusted, because yfinance reports rate
+      limiting by returning nothing — trusting that would turn a transient
+      outage into a permanent hole and let §2.4's coverage ratio blame
+      survivorship for an infrastructure failure. The retry is cheap: on a warm
+      run those symbols are the only ones left, so they batch together and a
+      dead batch costs three requests, not three per symbol.
+    * **A stale tail is topped up, not re-fetched.** `wanted.end` advances every
+      week, so keying the whole cache on it would repeat the 30-45 minute cold
+      fetch for the sake of five new sessions per symbol.
+    """
+    entries = manifest.get("symbols", {})
+    full: list[str] = []
+    tail: list[str] = []
+    reused: list[str] = []
+    cached_ends: list[date] = []
+
+    for symbol in symbols:
+        entry = entries.get(symbol) if not refresh else None
+        if entry is None or not entry.get("rows"):
+            full.append(symbol)
+            continue
+
+        start = date.fromisoformat(entry["requested_start"])
+        end = date.fromisoformat(entry["requested_end"])
+        if start > wanted.start:
+            full.append(symbol)  # missing warm-up history, not just a tail
+        elif end >= wanted.end:
+            reused.append(symbol)
+        else:
+            tail.append(symbol)
+            cached_ends.append(end)
+
+    # One request covers every tail, starting at the earliest session any of
+    # them still needs. Re-downloading a few days that some already hold is
+    # harmless — `PriceCache.merge` keeps the newer copy.
+    tail_range = DateRange(start=min(cached_ends), end=wanted.end) if cached_ends else None
+
+    return FetchPlan(
+        full=tuple(full), tail=tuple(tail), tail_range=tail_range, reused=tuple(reused)
+    )
+
 
 @dataclass(frozen=True)
 class FetchSummary:
@@ -244,6 +332,7 @@ class FetchSummary:
     fetched: tuple[str, ...]
     failed: tuple[str, ...]
     reused: tuple[str, ...]
+    topped_up: tuple[str, ...]
     rates_ok: bool
 
 
@@ -262,65 +351,90 @@ def fill_cache(
 ) -> FetchSummary:
     """Fetch whatever the cache is missing, at v1's throttle and retry discipline.
 
-    Symbols already cached over the wanted range are left alone: the cold fetch
-    is 30-45 minutes of network time (§3.3), and re-running the analysis must
-    not repeat it. `refresh` forces the whole universe to be re-fetched.
+    Symbols already cached over the wanted range are left alone, and one whose
+    cache merely stops short of the window end gets only the missing tail: the
+    cold fetch is 30-45 minutes of network time (§3.3), and re-running the
+    analysis a week later must not repeat it. `refresh` forces a full re-fetch.
     """
     manifest = cache.read_manifest()
     wanted = window.fetch_range
     ordered = list(dict.fromkeys(symbols))
 
-    missing = [
-        symbol for symbol in ordered if refresh or not cache.covers(manifest, symbol, wanted)
-    ]
-    reused = tuple(symbol for symbol in ordered if symbol not in set(missing))
-    logger.info("cache: %d symbols reusable, %d to fetch", len(reused), len(missing))
+    plan = plan_fetch(manifest, ordered, wanted, refresh=refresh)
+    logger.info(
+        "cache: %d reusable, %d to fetch in full, %d needing only a tail from %s",
+        len(plan.reused),
+        len(plan.full),
+        len(plan.tail),
+        plan.tail_range.start if plan.tail_range else "-",
+    )
 
     limiter = throttle if throttle is not None else prices.Throttle(sleeper=sleeper)
     entries = dict(manifest.get("symbols", {}))
 
-    def record(fetched: dict[str, pd.DataFrame], batch: Sequence[str]) -> None:
+    def recorder(asked: DateRange, *, topping_up: bool) -> prices.BatchCallback:
         """Persist one batch as it lands.
 
         The cold fetch runs for half an hour or more; writing only at the end
         would throw all of it away on a Ctrl-C or a dropped connection, and the
         next run would start from nothing.
         """
-        for symbol in batch:
-            frame = fetched.get(symbol)
-            if frame is not None:
-                cache.store(symbol, frame)
-            # A symbol that came back empty is recorded as attempted-with-no-data
-            # rather than left looking un-asked: §2.5 needs those distinguishable.
-            entries[symbol] = {
-                "requested_start": wanted.start.isoformat(),
-                "requested_end": wanted.end.isoformat(),
-                "rows": int(len(frame)) if frame is not None else 0,
-                "first_session": _iso_index(frame, 0) if frame is not None else None,
-                "last_session": _iso_index(frame, -1) if frame is not None else None,
-            }
-        cache.write_manifest({**manifest, "schema": CACHE_SCHEMA, "symbols": entries})
 
-    outcome = prices.FetchOutcome(frames={}, failed=())
-    if missing:
-        outcome = prices.fetch_batched(
-            missing,
-            request=wanted,
+        def record(fetched: dict[str, pd.DataFrame], batch: Sequence[str]) -> None:
+            for symbol in batch:
+                frame = fetched.get(symbol)
+                if frame is not None:
+                    cache.merge(symbol, frame) if topping_up else cache.store(symbol, frame)
+
+                previous = entries.get(symbol, {}) if topping_up else {}
+                rows = int(len(frame)) if frame is not None else 0
+                entries[symbol] = {
+                    "requested_start": min(
+                        asked.start,
+                        date.fromisoformat(previous["requested_start"])
+                        if previous.get("requested_start")
+                        else asked.start,
+                    ).isoformat(),
+                    # Recorded even when the tail came back empty: we asked over
+                    # this range and there was nothing more, which is the normal
+                    # state of a symbol that stopped trading mid-window. Only a
+                    # symbol with *no* rows at all is asked again next run.
+                    "requested_end": asked.end.isoformat(),
+                    "rows": rows + int(previous.get("rows", 0)),
+                    "first_session": previous.get("first_session")
+                    or (_iso_index(frame, 0) if frame is not None else None),
+                    "last_session": (_iso_index(frame, -1) if frame is not None else None)
+                    or previous.get("last_session"),
+                }
+            cache.write_manifest({**manifest, "schema": CACHE_SCHEMA, "symbols": entries})
+
+        return record
+
+    def run(group: Sequence[str], asked: DateRange, *, topping_up: bool) -> prices.FetchOutcome:
+        if not group:
+            return prices.FetchOutcome(frames={}, failed=())
+        return prices.fetch_batched(
+            group,
+            request=asked,
             batch_size=batch_size,
             downloader=downloader,
             splitter=split_dated_frame,
             throttle=limiter,
             sleeper=sleeper,
             rng=rng,
-            on_batch=record,
+            on_batch=recorder(asked, topping_up=topping_up),
         )
+
+    outcome = run(plan.full, wanted, topping_up=False)
+    tail_outcome = run(plan.tail, plan.tail_range or wanted, topping_up=True)
 
     rates_ok = _fill_rates(cache, wanted, downloader, limiter, sleeper, rng, refresh=refresh)
 
     # A symbol that failed on an earlier pass and succeeded on this one has to
     # drop off the failed list, or the cache would remember a name as dead long
     # after it started returning data.
-    previously_failed = set(manifest.get("failed", [])) - set(outcome.frames)
+    recovered = set(outcome.frames) | set(tail_outcome.frames)
+    previously_failed = set(manifest.get("failed", [])) - recovered
     manifest = {
         "schema": CACHE_SCHEMA,
         "snapshot_date": run_date.isoformat(),
@@ -328,6 +442,8 @@ def fill_cache(
         "window_end": window.end.isoformat(),
         "fetch_start": window.fetch_start.isoformat(),
         "symbols": entries,
+        # Only a full-range fetch that returned nothing counts as a failure. A
+        # tail that comes back empty means the symbol simply has no new sessions.
         "failed": sorted(previously_failed | set(outcome.failed)),
         "rates_cached": cache.has_rates(),
     }
@@ -337,7 +453,8 @@ def fill_cache(
         requested=tuple(ordered),
         fetched=tuple(sorted(outcome.frames)),
         failed=tuple(sorted(outcome.failed)),
-        reused=reused,
+        reused=plan.reused,
+        topped_up=tuple(sorted(tail_outcome.frames)),
         rates_ok=rates_ok,
     )
 

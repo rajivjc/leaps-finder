@@ -76,8 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         summary = data.fill_cache(universe, window, cache, run_date=run_date, refresh=args.refresh)
         logger.info(
-            "fetched %d, reused %d, no data for %d",
+            "fetched %d, topped up %d, reused %d, no data for %d",
             len(summary.fetched),
+            len(summary.topped_up),
             len(summary.reused),
             len(summary.failed),
         )
