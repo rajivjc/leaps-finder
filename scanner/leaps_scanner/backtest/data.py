@@ -25,7 +25,7 @@ from pathlib import Path
 import pandas as pd
 
 from leaps_scanner import indicators, prices
-from leaps_scanner.backtest.membership import Membership, MembershipSpan
+from leaps_scanner.backtest.membership import Membership, MembershipSpan, PriceSource
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,15 @@ PRICE_COLUMNS = [*prices.OHLCV_COLUMNS, ADJ_CLOSE]
 DIVIDEND_COLUMN = "Dividends"
 
 RATE_SYMBOL = "^IRX"  # §3.5: 13-week T-bill discount rate, the r input
-RATE_CACHE_NAME = "IRX"
+BENCHMARK_SYMBOL = "SPY"  # §3.5: §6.1's market delta and §6.3.1's total return
+
+# Auxiliary series (§3.5). They ride the ordinary batched price path rather than
+# a side channel of their own, which is what earns them the top-up logic in
+# `plan_fetch`: keyed on existence alone, a benchmark would silently serve last
+# week's history to §6.3.1's buy-and-hold, which runs to the window end. They are
+# not members, so they can never reach §2.4's accounting — that walks membership
+# spans, and neither symbol has one.
+AUXILIARY_SYMBOLS = (RATE_SYMBOL, BENCHMARK_SYMBOL)
 
 # §5.1's RV252 window, in log returns. One more close than returns is needed.
 RV_SESSIONS = 252
@@ -164,11 +172,10 @@ class PriceCache:
         self.root = Path(root)
         self.prices_dir = self.root / "prices"
         self.dividends_dir = self.root / "dividends"
-        self.rates_dir = self.root / "rates"
         self.manifest_path = self.root / "manifest.json"
 
     def ensure_dirs(self) -> None:
-        for directory in (self.prices_dir, self.dividends_dir, self.rates_dir):
+        for directory in (self.prices_dir, self.dividends_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
     # -- manifest ---------------------------------------------------------
@@ -188,7 +195,10 @@ class PriceCache:
     # -- per-symbol data --------------------------------------------------
 
     def _path(self, directory: Path, symbol: str) -> Path:
-        return directory / f"{symbol}.parquet"
+        # Index symbols carry a caret (`^IRX`) which is a shell metacharacter and
+        # awkward in a filename. No real ticker starts with an underscore, so the
+        # substitution cannot collide with one.
+        return directory / f"{symbol.replace('^', '_')}.parquet"
 
     def store(self, symbol: str, frame: pd.DataFrame) -> None:
         """Split one fetched frame into its price and dividend halves."""
@@ -212,18 +222,16 @@ class PriceCache:
             return None
         return pd.read_parquet(path).sort_index()
 
-    def store_rates(self, frame: pd.DataFrame) -> None:
-        self.ensure_dirs()
-        frame.sort_index().to_parquet(self._path(self.rates_dir, RATE_CACHE_NAME))
-
     def has_rates(self) -> bool:
-        return self._path(self.rates_dir, RATE_CACHE_NAME).exists()
+        return self._path(self.prices_dir, RATE_SYMBOL).exists()
 
     def load_rates(self) -> pd.DataFrame | None:
-        path = self._path(self.rates_dir, RATE_CACHE_NAME)
-        if not path.exists():
-            return None
-        return pd.read_parquet(path).sort_index()
+        """^IRX history, for §5's r input."""
+        return self.load(RATE_SYMBOL)
+
+    def load_benchmark(self) -> pd.DataFrame | None:
+        """SPY history — P2 columns for §6.1, `Adj Close` for §6.3.1."""
+        return self.load(BENCHMARK_SYMBOL)
 
     def covers(self, manifest: dict, symbol: str, wanted: DateRange) -> bool:
         """True when the cache already holds `symbol` over the wanted range."""
@@ -334,6 +342,7 @@ class FetchSummary:
     reused: tuple[str, ...]
     topped_up: tuple[str, ...]
     rates_ok: bool
+    benchmark_ok: bool
 
 
 def fill_cache(
@@ -348,6 +357,7 @@ def fill_cache(
     sleeper: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
     refresh: bool = False,
+    auxiliary: Sequence[str] = AUXILIARY_SYMBOLS,
 ) -> FetchSummary:
     """Fetch whatever the cache is missing, at v1's throttle and retry discipline.
 
@@ -358,7 +368,9 @@ def fill_cache(
     """
     manifest = cache.read_manifest()
     wanted = window.fetch_range
-    ordered = list(dict.fromkeys(symbols))
+    # Auxiliary series lead so a partial run still lands the benchmark and the
+    # rate curve; `dict.fromkeys` keeps them single if a caller passes them too.
+    ordered = list(dict.fromkeys([*auxiliary, *symbols]))
 
     plan = plan_fetch(manifest, ordered, wanted, refresh=refresh)
     logger.info(
@@ -428,7 +440,14 @@ def fill_cache(
     outcome = run(plan.full, wanted, topping_up=False)
     tail_outcome = run(plan.tail, plan.tail_range or wanted, topping_up=True)
 
-    rates_ok = _fill_rates(cache, wanted, downloader, limiter, sleeper, rng, refresh=refresh)
+    rates_ok = cache.has_rates()
+    benchmark_ok = cache.load_benchmark() is not None
+    if not rates_ok:
+        logger.warning("%s history unavailable; r inputs will be missing", RATE_SYMBOL)
+    if not benchmark_ok:
+        logger.warning(
+            "%s history unavailable; benchmark comparisons will be missing", BENCHMARK_SYMBOL
+        )
 
     # A symbol that failed on an earlier pass and succeeded on this one has to
     # drop off the failed list, or the cache would remember a name as dead long
@@ -445,7 +464,8 @@ def fill_cache(
         # Only a full-range fetch that returned nothing counts as a failure. A
         # tail that comes back empty means the symbol simply has no new sessions.
         "failed": sorted(previously_failed | set(outcome.failed)),
-        "rates_cached": cache.has_rates(),
+        "rates_cached": rates_ok,
+        "benchmark_cached": benchmark_ok,
     }
     cache.write_manifest(manifest)
 
@@ -456,40 +476,8 @@ def fill_cache(
         reused=plan.reused,
         topped_up=tuple(sorted(tail_outcome.frames)),
         rates_ok=rates_ok,
+        benchmark_ok=benchmark_ok,
     )
-
-
-def _fill_rates(
-    cache: PriceCache,
-    wanted: DateRange,
-    downloader: prices.Downloader,
-    throttle: prices.Throttle,
-    sleeper: Callable[[float], None],
-    rng: random.Random | None,
-    *,
-    refresh: bool,
-) -> bool:
-    """Fetch ^IRX through the same batched path (§3.5)."""
-    if not refresh and cache.has_rates():
-        return True
-
-    outcome = prices.fetch_batched(
-        [RATE_SYMBOL],
-        request=wanted,
-        batch_size=1,
-        downloader=downloader,
-        splitter=split_dated_frame,
-        throttle=throttle,
-        sleeper=sleeper,
-        rng=rng,
-    )
-    frame = outcome.frames.get(RATE_SYMBOL)
-    if frame is None:
-        logger.warning("%s history unavailable; r inputs will be missing", RATE_SYMBOL)
-        return False
-
-    cache.store_rates(frame)
-    return True
 
 
 def _iso_index(frame: pd.DataFrame, position: int) -> str | None:
@@ -537,6 +525,10 @@ class UncoveredSymbol:
     covered_weeks: int
     spans: tuple[MembershipSpan, ...]
     has_data: bool
+    # §2.3a successors that priced part of this symbol, when they differ from it.
+    # Reported so the coverage output says which series did the pricing rather
+    # than leaving an alias to work invisibly.
+    price_symbols: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -544,10 +536,12 @@ class UncoveredSymbol:
             "member_weeks": self.member_weeks,
             "covered_weeks": self.covered_weeks,
             "has_data": self.has_data,
+            "price_symbols": list(self.price_symbols),
             "spans": [
                 {
                     "added": span.added.isoformat(),
                     "removed": span.removed.isoformat() if span.removed else None,
+                    "price_symbol": span.price_symbol,
                 }
                 for span in self.spans
             ],
@@ -566,6 +560,9 @@ class Coverage:
     members: int
     no_data_members: int
     uncovered: tuple[UncoveredSymbol, ...] = field(default=())
+    # §3.5's auxiliary series, reported rather than assumed: a report whose
+    # benchmark is missing must say so, not quietly omit the comparison.
+    auxiliary: tuple[tuple[str, bool], ...] = field(default=())
 
     @property
     def ratio(self) -> float:
@@ -598,6 +595,7 @@ class Coverage:
             "no_data_members": self.no_data_members,
             "status": self.status,
             "low_coverage_warning": self.low_coverage_warning,
+            "auxiliary": {symbol: cached for symbol, cached in self.auxiliary},
             "uncovered": [symbol.as_dict() for symbol in self.uncovered],
         }
 
@@ -612,6 +610,19 @@ def covered_weeks(frame: pd.DataFrame | None) -> frozenset[date]:
         return frozenset()
     sessions = pd.DatetimeIndex(frame.index)
     return frozenset(week_ending(stamp.date()) for stamp in sessions)
+
+
+def source_frame(cache: PriceCache, source: PriceSource) -> pd.DataFrame | None:
+    """The cached series that prices one span, cut at its re-ticker date (§2.3a).
+
+    The cut is upper-bound only. A lower bound would be wrong: the successor's
+    pre-rename sessions *are* this company — that is the whole point of the alias
+    — and B2 needs the history before the span opens to warm up SMA200 and RV252.
+    """
+    frame = cache.load(source.symbol)
+    if frame is None or frame.empty or source.until is None:
+        return frame
+    return frame[pd.DatetimeIndex(frame.index) < pd.Timestamp(source.until)]
 
 
 def compute_coverage(
@@ -637,14 +648,32 @@ def compute_coverage(
     no_data = 0
     uncovered: list[UncoveredSymbol] = []
 
+    # One symbol can need several series — a renamed company's own ticker for
+    # some spans and its successor's for others — so weeks are resolved span by
+    # span. The cache read is memoized because META prices both FB's span and
+    # its own, and re-reading a decade of Parquet per week would be absurd.
+    available_for: dict[PriceSource, frozenset[date]] = {}
+
+    def weeks_available(source: PriceSource) -> frozenset[date]:
+        if source not in available_for:
+            available_for[source] = covered_weeks(source_frame(cache, source))
+        return available_for[source]
+
     for symbol, weeks in member_weeks.items():
-        frame = cache.load(symbol)
-        available = covered_weeks(frame)
-        hits = sum(1 for friday in weeks if friday in available)
+        hits = 0
+        sources: set[PriceSource] = set()
+        for friday in weeks:
+            span = membership.span_on(symbol, friday)
+            if span is None:  # not reachable: member_weeks came from these spans
+                continue
+            source = membership.price_source(span)
+            sources.add(source)
+            if friday in weeks_available(source):
+                hits += 1
 
         total += len(weeks)
         covered_total += hits
-        has_data = bool(available)
+        has_data = any(weeks_available(source) for source in sources)
         if not has_data:
             no_data += 1
         if hits < len(weeks):
@@ -655,6 +684,7 @@ def compute_coverage(
                     covered_weeks=hits,
                     spans=membership.spans_for(symbol),
                     has_data=has_data,
+                    price_symbols=tuple(sorted({s.symbol for s in sources if s.symbol != symbol})),
                 )
             )
 
@@ -669,4 +699,7 @@ def compute_coverage(
         members=len(member_weeks),
         no_data_members=no_data,
         uncovered=tuple(uncovered),
+        auxiliary=tuple(
+            (symbol, cache.load(symbol) is not None) for symbol in sorted(AUXILIARY_SYMBOLS)
+        ),
     )

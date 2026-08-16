@@ -49,6 +49,10 @@ class MembershipSpan:
     symbol: str
     added: date
     removed: date | None  # None = still a member at the retrieval date
+    # §2.3a: the ticker this span's prices live under, when the company
+    # re-tickered. Holds the *immediate* successor; `Membership.price_source`
+    # walks any chain. None means the span prices itself.
+    price_symbol: str | None = None
 
     def covers(self, day: date) -> bool:
         """§2.2's membership rule, and the only place it is written down."""
@@ -59,6 +63,20 @@ class MembershipSpan:
         if self.added > end:
             return False
         return self.removed is None or self.removed > start
+
+
+@dataclass(frozen=True)
+class PriceSource:
+    """Which cached series prices one membership span, and how much of it (§2.3a).
+
+    `until` is the span's own removal date, not the successor's. Reading META for
+    Facebook's span must stop where Facebook's membership row stops: the sessions
+    after it belong to META's own row, and counting them twice would inflate
+    coverage for a week no single membership row owns.
+    """
+
+    symbol: str
+    until: date | None  # exclusive; None = read the whole series
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,69 @@ class Membership:
     def members_between(self, start: date, end: date) -> tuple[str, ...]:
         """Every symbol that is a member on at least one day of the range."""
         return tuple(sorted({span.symbol for span in self.spans if span.overlaps(start, end)}))
+
+    def span_on(self, symbol: str, day: date) -> MembershipSpan | None:
+        """The span that makes `symbol` a member on `day`, if any.
+
+        Spans for one symbol never overlap (enforced at load), so this is
+        unambiguous — which is what lets a recycled ticker resolve to the right
+        company rather than to whichever span happened to be found first.
+        """
+        for span in self.spans:
+            if span.symbol == symbol and span.covers(day):
+                return span
+        return None
+
+    def price_source(self, span: MembershipSpan) -> PriceSource:
+        """Which cached series prices this span, following any rename chain (§2.3a).
+
+        The chain hop is `(symbol, removed) -> the successor's span added that
+        same day`, repeated while the span reached carries its own alias. Only
+        `ANTM` chains today (`WLP -> ANTM -> ELV`), but resolving transitively is
+        what lets the CSV record the immediate successor — the fact that was
+        actually sourced — instead of a terminal ticker nobody announced.
+
+        The cutoff stays the *first* span's removal date throughout: the chain
+        moves which file is read, never how much of the calendar it covers.
+        """
+        if span.price_symbol is None:
+            return PriceSource(symbol=span.symbol, until=None)
+
+        target, seen = span.price_symbol, {span.symbol}
+        hop = span
+        while True:
+            if target in seen:  # cycle; validation rejects these at load
+                break
+            seen.add(target)
+            successor = self._span_added_on(target, hop.removed)
+            if successor is None or successor.price_symbol is None:
+                break
+            hop, target = successor, successor.price_symbol
+
+        return PriceSource(symbol=target, until=span.removed)
+
+    def price_symbols_between(self, start: date, end: date) -> tuple[str, ...]:
+        """Rename successors that must be fetched for spans overlapping the range.
+
+        Every one of them is also a member today, so this is currently a no-op
+        against `members_between`. It is not redundant: the pairing is a
+        convention of the compiled file, not a guarantee, and a successor that
+        stops being a member would otherwise go silently unfetched.
+        """
+        wanted = {
+            self.price_source(span).symbol
+            for span in self.spans
+            if span.price_symbol is not None and span.overlaps(start, end)
+        }
+        return tuple(sorted(wanted))
+
+    def _span_added_on(self, symbol: str, day: date | None) -> MembershipSpan | None:
+        if day is None:
+            return None
+        for span in self.spans:
+            if span.symbol == symbol and span.added == day:
+                return span
+        return None
 
     def member_weeks(self, week_endings: Sequence[date]) -> dict[str, tuple[date, ...]]:
         """The weeks each symbol was a member, keyed by week-ending Friday.
@@ -152,9 +233,23 @@ def load_spans(path: Path | None = None) -> list[MembershipSpan]:
 
         if removed is not None and removed < added:
             raise ValueError(f"{name} line {number}: {symbol} removed {removed} < added")
-        spans.append(MembershipSpan(symbol=symbol, added=added, removed=removed))
+
+        price_symbol = normalize_symbol(row.get("price_symbol") or "") or None
+        if price_symbol is not None:
+            if price_symbol == symbol:
+                raise ValueError(f"{name} line {number}: {symbol} aliases itself")
+            if removed is None:
+                # A ticker still trading prices itself; an alias here would say
+                # the company re-tickered and also never left, which is not a
+                # state the file can describe.
+                raise ValueError(f"{name} line {number}: {symbol} aliases an open span")
+
+        spans.append(
+            MembershipSpan(symbol=symbol, added=added, removed=removed, price_symbol=price_symbol)
+        )
 
     _reject_overlaps(spans, name)
+    _reject_bad_aliases(spans, name)
     spans.sort(key=lambda span: (span.symbol, span.added))
     return spans
 
@@ -179,6 +274,54 @@ def _reject_overlaps(spans: Iterable[MembershipSpan], filename: str) -> None:
         for earlier, later in _pairs(ordered):
             if earlier.removed is None or earlier.removed > later.added:
                 raise ValueError(f"{filename}: overlapping spans for {symbol}")
+
+
+def _reject_bad_aliases(spans: Sequence[MembershipSpan], filename: str) -> None:
+    """Check every §2.3a alias against the encoding §2.3 already pins.
+
+    A rename is written as a removal of the old symbol and an addition of the new
+    one *on the same date*, so the successor must have a span opening exactly
+    where the aliased span closes. That makes the alias machine-checkable rather
+    than a hopeful convention, and it catches the mistake that matters: an alias
+    pointed at a symbol that was never the same company.
+
+    What is deliberately *not* checked is whether the successor has cached price
+    data. `COG -> CTRA` resolves correctly and still yields nothing, because
+    Coterra was itself acquired and purged. That is a fact about the cache, and
+    §2.4 reports it honestly as an uncovered span rather than a load failure.
+    """
+    added_on = {(span.symbol, span.added) for span in spans}
+
+    for span in spans:
+        if span.price_symbol is None:
+            continue
+        if (span.price_symbol, span.removed) not in added_on:
+            raise ValueError(
+                f"{filename}: {span.symbol} aliases {span.price_symbol}, which has no span "
+                f"beginning {span.removed} (§2.3 writes a rename as remove+add on one date)"
+            )
+
+    for span in spans:
+        if span.price_symbol is not None:
+            _walk_chain(span, spans, filename)
+
+
+def _walk_chain(start: MembershipSpan, spans: Sequence[MembershipSpan], filename: str) -> None:
+    """Follow a rename chain to its end, refusing to loop forever."""
+    seen = {start.symbol}
+    symbol, day = start.price_symbol, start.removed
+
+    while symbol is not None:
+        if symbol in seen:
+            raise ValueError(f"{filename}: rename chain from {start.symbol} cycles at {symbol}")
+        seen.add(symbol)
+        successor = next(
+            (s for s in spans if s.symbol == symbol and s.added == day),
+            None,
+        )
+        if successor is None:
+            return
+        symbol, day = successor.price_symbol, successor.removed
 
 
 def _pairs(items: Sequence[MembershipSpan]) -> Iterator[tuple[MembershipSpan, MembershipSpan]]:

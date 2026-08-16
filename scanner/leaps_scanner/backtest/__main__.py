@@ -63,18 +63,26 @@ def main(argv: list[str] | None = None) -> int:
     cache = data.PriceCache(args.cache_dir)
 
     universe = membership.members_between(window.start, window.end)
+    # §2.3a successors are members themselves today, so this adds nothing — but
+    # the pairing is a convention of the compiled file, not a guarantee, and a
+    # successor that stopped being a member would otherwise go unfetched and take
+    # its predecessor's whole span down with it.
+    successors = membership.price_symbols_between(window.start, window.end)
     logger.info(
-        "window %s..%s (fetch from %s); %d point-in-time members",
+        "window %s..%s (fetch from %s); %d point-in-time members, %d rename successors",
         window.start,
         window.end,
         window.fetch_start,
         len(universe),
+        len(successors),
     )
 
     if args.no_fetch:
         logger.info("--no-fetch: computing from the cache as it stands")
     else:
-        summary = data.fill_cache(universe, window, cache, run_date=run_date, refresh=args.refresh)
+        summary = data.fill_cache(
+            [*universe, *successors], window, cache, run_date=run_date, refresh=args.refresh
+        )
         logger.info(
             "fetched %d, topped up %d, reused %d, no data for %d",
             len(summary.fetched),
@@ -82,8 +90,6 @@ def main(argv: list[str] | None = None) -> int:
             len(summary.reused),
             len(summary.failed),
         )
-        if not summary.rates_ok:
-            logger.warning("%s history missing from the cache", data.RATE_SYMBOL)
 
     coverage = data.compute_coverage(membership, cache, window, run_date=run_date)
     report = coverage.to_json()

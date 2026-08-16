@@ -128,6 +128,9 @@ class TestFillCache:
         )
 
     def fill(self, cache, symbols, downloader, **kwargs):
+        # Auxiliary series are opted into per test: they ride every real fetch,
+        # but a test about universe batching should assert about the universe.
+        kwargs.setdefault("auxiliary", ())
         return data.fill_cache(
             symbols,
             self.window(),
@@ -298,27 +301,38 @@ class TestFillCache:
     def test_the_rate_series_is_cached_alongside(self, tmp_path):
         cache = data.PriceCache(tmp_path)
 
-        summary = self.fill(cache, ["AAA"], lambda symbols, request: frame(list(symbols)))
+        summary = self.fill(
+            cache,
+            ["AAA"],
+            lambda symbols, request: frame(list(symbols)),
+            auxiliary=data.AUXILIARY_SYMBOLS,
+        )
 
         assert summary.rates_ok
         assert cache.load_rates() is not None
 
     def test_a_missing_rate_series_is_reported_not_fatal(self, tmp_path):
+        # The auxiliary series ride the same batch as the universe, so the
+        # realistic failure is a partial response: everything else arrives and
+        # ^IRX simply is not in it.
         def downloader(symbols, request):
-            if data.RATE_SYMBOL in symbols:
-                return pd.DataFrame()
-            return frame(list(symbols))
+            served = [s for s in symbols if s != data.RATE_SYMBOL]
+            return frame(served)
 
-        summary = self.fill(data.PriceCache(tmp_path), ["AAA"], downloader)
+        summary = self.fill(
+            data.PriceCache(tmp_path), ["AAA"], downloader, auxiliary=data.AUXILIARY_SYMBOLS
+        )
 
-        assert summary.fetched == ("AAA",)
+        assert summary.fetched == ("AAA", "SPY")
         assert not summary.rates_ok
+        assert summary.benchmark_ok  # one missing series does not sink the other
 
 
 class TestWeeklyRerun:
     """A run a week later must top the cache up, not rebuild it (§3.4)."""
 
     def fill(self, cache, symbols, downloader, run_date, window, **kwargs):
+        kwargs.setdefault("auxiliary", ())
         return data.fill_cache(
             symbols,
             window,
@@ -590,3 +604,234 @@ class TestEligibility:
         history = frame(["AAA"], sessions=400, start=window.fetch_start.isoformat())
 
         assert data.first_eligible_date(history) <= window.start
+
+
+class TestRenamePricing:
+    """§2.3a: an aliased span is priced from its successor's cached series."""
+
+    window = data.Window(
+        start=date(2020, 1, 6), end=date(2020, 1, 31), fetch_start=date(2019, 1, 6)
+    )
+
+    def seed(self, tmp_path, symbols, sessions=20):
+        cache = data.PriceCache(tmp_path)
+        for symbol in symbols:
+            cache.store(symbol, frame([symbol], sessions=sessions, start="2020-01-06"))
+        cache.write_manifest({"schema": data.CACHE_SCHEMA, "snapshot_date": "2020-02-01"})
+        return cache
+
+    def coverage(self, cache, membership):
+        return data.compute_coverage(membership, cache, self.window, run_date=date(2020, 2, 1))
+
+    def test_a_renamed_symbol_is_priced_from_its_successor(self, tmp_path):
+        # OLD has no series of its own; NEW's covers the whole window.
+        cache = self.seed(tmp_path, ["NEW"])
+        members = Membership(
+            spans=(
+                MembershipSpan("OLD", date(2019, 1, 1), date(2020, 1, 20), "NEW"),
+                MembershipSpan("NEW", date(2020, 1, 20), None),
+            )
+        )
+
+        coverage = self.coverage(cache, members)
+
+        assert coverage.covered_member_weeks == coverage.total_member_weeks
+        assert coverage.no_data_members == 0
+
+    def test_without_the_alias_the_same_span_is_uncovered(self, tmp_path):
+        # The control: identical data, no alias. Proves the alias is what moved
+        # the number rather than the fixture being trivially covered.
+        cache = self.seed(tmp_path, ["NEW"])
+        members = Membership(
+            spans=(
+                MembershipSpan("OLD", date(2019, 1, 1), date(2020, 1, 20)),
+                MembershipSpan("NEW", date(2020, 1, 20), None),
+            )
+        )
+
+        assert (
+            self.coverage(cache, members).covered_member_weeks
+            < len(data.week_endings(self.window.start, self.window.end)) * 2
+        )
+
+    def test_the_successors_later_sessions_do_not_count_for_the_old_symbol(self, tmp_path):
+        # The cutoff. NEW trades all month; OLD left on the 20th, so OLD must
+        # not collect the weeks that belong to NEW's own membership row.
+        cache = self.seed(tmp_path, ["NEW"])
+        members = Membership(
+            spans=(
+                MembershipSpan("OLD", date(2019, 1, 1), date(2020, 1, 20), "NEW"),
+                MembershipSpan("NEW", date(2020, 1, 20), None),
+            )
+        )
+        weeks = members.member_weeks(data.week_endings(self.window.start, self.window.end))
+
+        coverage = self.coverage(cache, members)
+        old = next((u for u in coverage.uncovered if u.symbol == "OLD"), None)
+
+        # OLD is fully covered over its own weeks and claims no others.
+        assert old is None
+        assert coverage.total_member_weeks == len(weeks["OLD"]) + len(weeks["NEW"])
+
+    def test_a_recycled_symbol_keeps_its_own_series_for_the_later_span(self, tmp_path):
+        # The IR shape: first span aliased to TT, second span is a different
+        # company that must price itself.
+        cache = self.seed(tmp_path, ["IR", "TT"])
+        members = Membership(
+            spans=(
+                MembershipSpan("IR", date(2019, 1, 1), date(2020, 1, 20), "TT"),
+                MembershipSpan("IR", date(2020, 1, 20), None),
+                MembershipSpan("TT", date(2020, 1, 20), None),
+            )
+        )
+
+        first = members.price_source(members.span_on("IR", date(2020, 1, 10)))
+        second = members.price_source(members.span_on("IR", date(2020, 1, 31)))
+
+        assert (first.symbol, second.symbol) == ("TT", "IR")
+        assert self.coverage(cache, members).status == "ok"
+
+    def test_a_dead_chain_leaves_the_weeks_uncovered(self, tmp_path):
+        # COG -> CTRA, where the successor was itself acquired and purged. The
+        # honest outcome is an uncovered span, not a crash and not a fake fill.
+        cache = self.seed(tmp_path, [])
+        members = Membership(
+            spans=(
+                MembershipSpan("COG", date(2019, 1, 1), date(2020, 1, 20), "CTRA"),
+                MembershipSpan("CTRA", date(2020, 1, 20), None),
+            )
+        )
+
+        coverage = self.coverage(cache, members)
+
+        assert coverage.covered_member_weeks == 0
+        assert {u.symbol for u in coverage.uncovered} == {"COG", "CTRA"}
+
+    def test_aliasing_does_not_change_the_denominator(self, tmp_path):
+        spans = (
+            MembershipSpan("OLD", date(2019, 1, 1), date(2020, 1, 20), "NEW"),
+            MembershipSpan("NEW", date(2020, 1, 20), None),
+        )
+        plain = tuple(MembershipSpan(s.symbol, s.added, s.removed) for s in spans)
+        cache = self.seed(tmp_path, ["NEW"])
+
+        with_alias = self.coverage(cache, Membership(spans=spans))
+        without = self.coverage(cache, Membership(spans=plain))
+
+        assert with_alias.total_member_weeks == without.total_member_weeks
+        assert with_alias.members == without.members
+
+    def test_the_report_names_the_series_that_did_the_pricing(self, tmp_path):
+        # An alias must not work invisibly: §2.4's output says which series
+        # priced the symbol whenever it is not the symbol itself.
+        cache = self.seed(tmp_path, ["NEW"], sessions=2)
+        members = Membership(
+            spans=(
+                MembershipSpan("OLD", date(2019, 1, 1), date(2020, 1, 20), "NEW"),
+                MembershipSpan("NEW", date(2020, 1, 20), None),
+            )
+        )
+
+        coverage = self.coverage(cache, members)
+        old = next(u for u in coverage.uncovered if u.symbol == "OLD")
+
+        assert old.price_symbols == ("NEW",)
+        assert old.as_dict()["spans"][0]["price_symbol"] == "NEW"
+
+
+class TestBenchmark:
+    """§3.5: SPY is cached like a member but is never counted as one."""
+
+    def test_the_benchmark_rides_the_ordinary_fetch(self, tmp_path):
+        asked = []
+
+        def downloader(symbols, request):
+            asked.extend(symbols)
+            return frame(list(symbols))
+
+        cache = data.PriceCache(tmp_path)
+        summary = data.fill_cache(
+            ["AAA"],
+            data.Window(date(2020, 1, 6), date(2020, 1, 10), date(2019, 1, 6)),
+            cache,
+            run_date=date(2020, 1, 12),
+            downloader=downloader,
+            throttle=no_throttle(),
+            sleeper=lambda _: None,
+            rng=random.Random(0),
+        )
+
+        assert data.BENCHMARK_SYMBOL in asked
+        assert summary.benchmark_ok
+        assert data.ADJ_CLOSE in cache.load_benchmark().columns
+
+    def test_the_benchmark_tops_up_when_the_window_advances(self, tmp_path):
+        # The reason it does not follow the old rate-series pattern: that one
+        # short-circuited on existence, so a benchmark would serve stale history
+        # to a buy-and-hold that runs to the window end.
+        ranges = []
+
+        def downloader(symbols, request):
+            ranges.append((tuple(symbols), request.start, request.end))
+            sessions = len(pd.bdate_range(start=request.start, end=request.end))
+            return frame(list(symbols), sessions=sessions, start=request.start.isoformat())
+
+        cache = data.PriceCache(tmp_path)
+        common = dict(
+            downloader=downloader,
+            throttle=no_throttle(),
+            sleeper=lambda _: None,
+            rng=random.Random(0),
+        )
+        first = data.evaluation_window(date(2026, 8, 16))
+        second = data.evaluation_window(date(2026, 8, 23))
+        data.fill_cache([], first, cache, run_date=date(2026, 8, 16), **common)
+        before = cache.load_benchmark().index[-1]
+        summary = data.fill_cache([], second, cache, run_date=date(2026, 8, 23), **common)
+
+        assert data.BENCHMARK_SYMBOL in summary.topped_up
+        assert cache.load_benchmark().index[-1] > before
+
+    def test_a_missing_benchmark_is_reported_not_fatal(self, tmp_path):
+        def downloader(symbols, request):
+            return frame([s for s in symbols if s != data.BENCHMARK_SYMBOL])
+
+        cache = data.PriceCache(tmp_path)
+        summary = data.fill_cache(
+            ["AAA"],
+            data.Window(date(2020, 1, 6), date(2020, 1, 10), date(2019, 1, 6)),
+            cache,
+            run_date=date(2020, 1, 12),
+            downloader=downloader,
+            throttle=no_throttle(),
+            sleeper=lambda _: None,
+            rng=random.Random(0),
+        )
+
+        assert not summary.benchmark_ok
+        assert summary.rates_ok
+        assert cache.load("AAA") is not None
+
+    def test_the_benchmark_never_enters_the_coverage_ratio(self, tmp_path):
+        cache = data.PriceCache(tmp_path)
+        for symbol in ("AAA", data.BENCHMARK_SYMBOL, data.RATE_SYMBOL):
+            cache.store(symbol, frame([symbol], sessions=20, start="2020-01-06"))
+        cache.write_manifest({"schema": data.CACHE_SCHEMA, "snapshot_date": "2020-02-01"})
+        members = Membership(spans=(MembershipSpan("AAA", date(2019, 1, 1), None),))
+
+        coverage = data.compute_coverage(
+            members,
+            cache,
+            data.Window(date(2020, 1, 6), date(2020, 1, 31), date(2019, 1, 6)),
+            run_date=date(2020, 2, 1),
+        )
+
+        assert coverage.members == 1
+        assert coverage.as_dict()["auxiliary"] == {"SPY": True, "^IRX": True}
+
+    def test_an_index_symbol_is_stored_under_a_safe_filename(self, tmp_path):
+        cache = data.PriceCache(tmp_path)
+        cache.store(data.RATE_SYMBOL, frame([data.RATE_SYMBOL], sessions=3))
+
+        assert cache.load_rates() is not None
+        assert not any("^" in path.name for path in cache.prices_dir.iterdir())
