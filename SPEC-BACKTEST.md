@@ -85,6 +85,25 @@ the exact string travels as the required `banner` field of `results.json` (§8).
 3. **Symbol normalization.** Class shares map to yfinance form (`BRK.B → BRK-B`,
    `BF.B → BF-B`). Renames/re-tickers are handled by rows in the CSV (old symbol removed,
    new symbol added on the effective date).
+3a. **Price alias (renames).** Yahoo serves a renamed company's full history only under
+   its *current* ticker: `FB` returns nothing, `META` returns 2012-onward. The row pairs
+   of §2.3 therefore stay as the record of which ticker traded when, and a fourth CSV
+   column `price_symbol` names the ticker whose cached series prices that span. It holds
+   the **immediate** successor — the sourced historical fact — and the loader walks the
+   chain to its terminal ticker (`WLP → ANTM → ELV`), guarding against cycles.
+
+   The alias is scoped to **one span, never to a symbol**, because tickers are recycled:
+   `IR` was Ingersoll-Rand plc until 2020-03-02 and a different Ingersoll Rand Inc from
+   that date, so a symbol-wide alias would price the second company off the first's
+   successor. A span-scoped alias also cannot double-count, since spans do not overlap
+   and the successor's series is only ever read inside the aliased span.
+
+   A chain whose terminal ticker has no data — the successor was itself acquired and
+   purged, as with `COG → CTRA` — is **not an error**. Resolution succeeds, the span
+   stays uncovered, and §2.4 reports it as the survivorship gap it genuinely is. The CSV
+   is validated on CSV-level facts only: a `price_symbol` naming its own symbol, naming a
+   symbol absent from the file, or forming a cycle is refused. Whether the cache holds
+   data for it is a property of the cache, not of the membership record.
 4. **Coverage accounting.** For every member, attempt the full price history. A
    member-week is *covered* if OHLCV exists for that week while the symbol was a member.
    The report must state: coverage ratio (covered member-weeks ÷ total member-weeks),
@@ -128,7 +147,12 @@ the exact string travels as the required `banner` field of `results.json` (§8).
    All computation runs from the cache; a run records the cache snapshot date. Raw price
    data is never committed (size; Yahoo terms).
 5. **Auxiliary series.** ^IRX daily history (for r); per-symbol dividend history
-   (for q). Both cached alongside prices.
+   (for q); SPY daily history including `Adj Close`, for §6.1's per-trade market delta
+   and §6.3.1's total-return benchmark. All cached alongside prices. SPY is a benchmark,
+   **not a universe member** — it is fetched outside the membership path and is excluded
+   from §2.4's member-week accounting, where counting it would corrupt the ratio. A
+   missing benchmark series is reported as a warning, like a missing ^IRX series; it
+   disables the benchmarks that need it rather than failing the run.
 6. **Sector labels.** Current GICS sector per symbol from the v1 `tickers` table /
    yfinance, applied historically (2-per-sector cap only). Minor look-ahead; in the
    bias register.
@@ -320,6 +344,7 @@ Every report embeds this table (values updated per run where applicable).
 | 6 | r and q flat per trade | Minor | — |
 | 7 | Current sector labels applied historically | Minor | Affects only the 2-per-sector cap |
 | 8 | Membership CSV errors possible | Unknown | Source + retrieval date recorded |
+| 8a | Rename effective dates and price aliases (§2.3a) are hand-sourced; the change table excludes ticker changes by editorial policy | Unknown — a wrong alias splices two securities into one series, which no coverage number would reveal | Each pair carries its source in the compiler; alias is span-scoped and unit-tested against the recycled-ticker case |
 | 9 | Earnings-distance gate not simulated | Unknown (backtest enters where live Strict/Balanced would wait) | Stated |
 | 10 | Stock-track returns exclude dividends | **Hurts** the stock track slightly vs. total-return intuition | Vehicle is a call; benchmarks labeled |
 | 11 | Cash earns 0% in the sleeve | **Hurts** the sleeve | Conservative by construction |
@@ -332,7 +357,7 @@ Every report embeds this table (values updated per run where applicable).
 ```
 scanner/leaps_scanner/backtest/
 ├── data/sp500_membership.csv   # PIT membership (committed)
-├── membership.py               # §2 loader + normalization
+├── membership.py               # §2 loader + normalization + §2.3a alias resolution
 ├── data.py                     # cached 10y fetch (extends prices.py machinery per §3.3)
 ├── engine.py                   # §4 event loop (stock track)
 ├── synthetic.py                # §5 pricing/strike — extends options.py: the call price
@@ -340,6 +365,13 @@ scanner/leaps_scanner/backtest/
 │                               #   norm_cdf/bs_delta (v1 has delta only), then imported
 ├── sleeve.py                   # §6.2 (breaker per §6.2 — normative in this spec)
 └── report.py                   # report.md + results.json + SVG curves
+
+scanner/tools/
+└── build_membership.py         # regenerates the §2.1 CSV from the Wikipedia change
+                                #   history + the hand-sourced §2.3a rename table.
+                                #   Committed so the data file is reproducible: the CSV
+                                #   is compiled, not hand-edited, and a data file whose
+                                #   compiler is lost cannot be audited or rebuilt.
 ```
 
 - **Run:** manual only — `make backtest` (target added in B1) /

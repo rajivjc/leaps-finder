@@ -12,6 +12,8 @@ from leaps_scanner.backtest.membership import (
     normalize_symbol,
 )
 
+ALIAS_HEADER = "symbol,added,removed,price_symbol\n"
+
 
 def write_csv(tmp_path, rows: str, header: str = "symbol,added,removed\n"):
     path = tmp_path / "membership.csv"
@@ -166,8 +168,145 @@ class TestQueries:
         assert weeks["AAA"] == tuple(fridays)
 
 
+class TestPriceAlias:
+    """§2.3a: which cached series prices a span, when the company re-tickered."""
+
+    def load(self, tmp_path, rows):
+        return Membership(spans=tuple(load_spans(write_csv(tmp_path, rows, ALIAS_HEADER))))
+
+    def source(self, membership, symbol, day):
+        return membership.price_source(membership.span_on(symbol, day))
+
+    def test_a_renamed_span_prices_from_its_successor(self, tmp_path):
+        members = self.load(tmp_path, "FB,2013-12-23,2022-06-09,META\nMETA,2022-06-09,,\n")
+
+        assert self.source(members, "FB", date(2020, 1, 3)).symbol == "META"
+
+    def test_a_span_without_an_alias_prices_itself(self, tmp_path):
+        members = self.load(tmp_path, "AAPL,1982-11-30,,\n")
+
+        source = self.source(members, "AAPL", date(2020, 1, 3))
+        assert source.symbol == "AAPL"
+        assert source.until is None
+
+    def test_the_successor_series_is_cut_at_the_re_ticker_date(self, tmp_path):
+        # Without the cutoff, FB would also claim META's own member-weeks, and a
+        # week no single membership row owns would be counted twice.
+        members = self.load(tmp_path, "FB,2013-12-23,2022-06-09,META\nMETA,2022-06-09,,\n")
+
+        assert self.source(members, "FB", date(2020, 1, 3)).until == date(2022, 6, 9)
+
+    def test_a_chain_resolves_to_the_ticker_that_still_trades(self, tmp_path):
+        # WLP -> ANTM -> ELV. The middle ticker has no Yahoo data at all, which
+        # is exactly why resolution cannot stop at the immediate successor.
+        members = self.load(
+            tmp_path,
+            "WLP,1999-06-09,2014-12-03,ANTM\nANTM,2014-12-03,2022-06-28,ELV\nELV,2022-06-28,,\n",
+        )
+
+        assert self.source(members, "WLP", date(2010, 1, 8)).symbol == "ELV"
+
+    def test_a_chain_keeps_the_first_spans_cutoff_not_the_last(self, tmp_path):
+        members = self.load(
+            tmp_path,
+            "WLP,1999-06-09,2014-12-03,ANTM\nANTM,2014-12-03,2022-06-28,ELV\nELV,2022-06-28,,\n",
+        )
+
+        assert self.source(members, "WLP", date(2010, 1, 8)).until == date(2014, 12, 3)
+
+    def test_an_alias_is_scoped_to_the_span_not_the_symbol(self, tmp_path):
+        # The regression that matters most. IR is Ingersoll-Rand plc until
+        # 2020-03-02 and a different Ingersoll Rand Inc after it. A symbol-wide
+        # alias would price the second company off the first's successor.
+        members = self.load(
+            tmp_path,
+            "IR,2010-11-17,2020-03-02,TT\nIR,2020-03-02,,\nTT,2020-03-02,,\n",
+        )
+
+        assert self.source(members, "IR", date(2015, 1, 2)).symbol == "TT"
+        assert self.source(members, "IR", date(2022, 1, 7)).symbol == "IR"
+
+    def test_the_fetch_list_carries_rename_successors(self, tmp_path):
+        members = self.load(tmp_path, "FB,2013-12-23,2022-06-09,META\nMETA,2022-06-09,,\n")
+
+        assert members.price_symbols_between(date(2016, 1, 1), date(2020, 1, 1)) == ("META",)
+
+    def test_an_alias_naming_its_own_symbol_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="aliases itself"):
+            self.load(tmp_path, "FB,2013-12-23,2022-06-09,FB\n")
+
+    def test_an_alias_on_a_still_open_span_is_rejected(self, tmp_path):
+        # A company cannot both have re-tickered and never left.
+        with pytest.raises(ValueError, match="aliases an open span"):
+            self.load(tmp_path, "FB,2013-12-23,,META\nMETA,2022-06-09,,\n")
+
+    def test_an_alias_whose_successor_does_not_start_that_day_is_rejected(self, tmp_path):
+        # §2.3 writes a rename as remove+add on one date; anything else means
+        # the alias points at a company that was never this one.
+        with pytest.raises(ValueError, match="no span beginning"):
+            self.load(tmp_path, "FB,2013-12-23,2022-06-09,META\nMETA,2023-01-03,,\n")
+
+    def test_a_cycle_in_the_chain_is_rejected_not_hung(self, tmp_path):
+        # Every alias here pairs correctly, so only the walk itself can catch
+        # it: AAA hands off to BBB, which hands back to AAA.
+        with pytest.raises(ValueError, match="cycles"):
+            self.load(
+                tmp_path,
+                "AAA,2010-01-01,2015-01-01,BBB\nBBB,2015-01-01,2020-01-01,AAA\nAAA,2020-01-01,,\n",
+            )
+
+    def test_a_dead_chain_resolves_rather_than_raising(self, tmp_path):
+        # COG -> CTRA, where Coterra was itself acquired and purged. Resolution
+        # must succeed; §2.4 then reports the span as uncovered, honestly.
+        members = self.load(
+            tmp_path, "COG,2008-06-23,2021-10-04,CTRA\nCTRA,2021-10-04,2026-05-07,\n"
+        )
+
+        assert self.source(members, "COG", date(2018, 1, 5)).symbol == "CTRA"
+
+
 class TestShippedFile:
     """The committed CSV has to satisfy everything the loader checks."""
+
+    def test_every_row_carries_the_price_symbol_field(self):
+        rows = [
+            line for line in membership_text().splitlines() if line and not line.startswith("#")
+        ]
+        assert rows[0] == "symbol,added,removed,price_symbol"
+        assert all(line.count(",") == 3 for line in rows[1:])
+
+    def test_the_header_documents_the_price_symbol_column(self):
+        comments = [line for line in membership_text().splitlines() if line.startswith("#")]
+        assert any("price_symbol" in line for line in comments)
+
+    def test_every_alias_pairs_with_an_addition_on_the_effective_date(self):
+        # The §2.3 encoding, checked against the shipped file rather than
+        # trusted: an alias that does not pair points at a different company.
+        members = Membership.load()
+        starts = {(span.symbol, span.added) for span in members.spans}
+        for span in members.spans:
+            if span.price_symbol is not None:
+                assert (span.price_symbol, span.removed) in starts, span
+
+    def test_a_reassigned_symbol_keeps_its_later_span_unaliased(self):
+        # IR and Q were both handed to different companies. If a later span ever
+        # acquired an alias, hundreds of member-weeks would silently be priced
+        # off the wrong security.
+        members = Membership.load()
+        for symbol in ("IR", "Q"):
+            spans = members.spans_for(symbol)
+            assert spans, symbol
+            assert spans[-1].price_symbol is None, symbol
+
+    def test_the_shipped_aliases_all_resolve(self):
+        members = Membership.load()
+        aliased = [span for span in members.spans if span.price_symbol is not None]
+
+        assert len(aliased) == 19
+        for span in aliased:
+            source = members.price_source(span)
+            assert source.symbol != span.symbol
+            assert source.until == span.removed
 
     def test_it_loads_and_validates(self):
         spans = load_spans()
