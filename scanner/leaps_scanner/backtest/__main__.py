@@ -1,20 +1,28 @@
 """`python -m leaps_scanner.backtest` — manual, local, never a scheduled job.
 
-B1 scope: resolve the window, build the point-in-time universe, fill the price
-cache, and report §2.4 coverage. The signal engine, the option overlay and the
-sleeve arrive in B2-B4; until then this command's job is to prove the data under
-them is honest.
+Through B2: resolve the window, build the point-in-time universe, fill the price
+cache, report §2.4 coverage, then replay §4 over the universe and print §6.1's
+Track A tables for the stock track. The option overlay and the sleeve arrive in
+B3-B4, and so does the committed report — §8 puts results under
+`docs/backtest/<run-date>/`, which is B4's deliverable, so this command writes
+nothing unless asked to.
+
+§2.4's floor gates the engine, not just the report: below 80% coverage the run
+is `failed` and computes no statistics, because a headline number over a
+universe that thin would be exactly the "partial data looking complete" the
+spec forbids.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import date
 from pathlib import Path
 
-from leaps_scanner.backtest import data
+from leaps_scanner.backtest import data, engine, metrics
 from leaps_scanner.backtest.membership import Membership
 
 logger = logging.getLogger("leaps_scanner.backtest")
@@ -49,6 +57,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="also write the coverage report as JSON to this path",
+    )
+    parser.add_argument(
+        "--coverage-only",
+        action="store_true",
+        help="stop after §2.4 coverage; do not replay the §4 signal engine",
+    )
+    parser.add_argument(
+        "--track-a-json",
+        type=Path,
+        default=None,
+        help="write §6.1's Track A statistics as JSON to this path",
+    )
+    parser.add_argument(
+        "--trades-json",
+        type=Path,
+        default=None,
+        help="write every simulated trade as JSON to this path",
     )
     return parser
 
@@ -99,9 +124,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(_summary_line(coverage), file=sys.stderr)
 
-    # §2.4: below the floor the run is `failed` and commits no report. B1 has no
-    # report to withhold yet, so it withholds the exit code instead — B2 onwards
-    # must not build on a universe this thin.
+    # §2.4: below the floor the run is `failed` and commits no report, so it
+    # must not compute one either — a statistic over a universe this thin is
+    # exactly the partial data that must never look complete.
     if coverage.status == "failed":
         logger.error(
             "coverage %.1f%% is below the %.0f%% floor: run status failed, no report",
@@ -115,7 +140,68 @@ def main(argv: list[str] | None = None) -> int:
             100 * coverage.ratio,
             100 * data.COVERAGE_WARN_BELOW,
         )
+
+    if args.coverage_only:
+        return 0
+
+    _run_engine(membership, cache, window, args)
     return 0
+
+
+def _run_engine(
+    membership: Membership,
+    cache: data.PriceCache,
+    window: data.Window,
+    args: argparse.Namespace,
+) -> None:
+    """§4's replay and §6.1's Track A tables, for the stock track."""
+    result = engine.run(membership, cache, window)
+    logger.info(
+        "engine: %d rename chains, %d priced; %s",
+        result.chains,
+        result.priced_chains,
+        ", ".join(f"{name} {len(rows)} trades" for name, rows in result.trades.items()),
+    )
+
+    benchmark = metrics.BenchmarkPrices(cache.load_benchmark())
+    stats = [
+        metrics.track_a(name, result.trades[name], result.skipped[name], benchmark)
+        for name in result.trades
+    ]
+
+    if args.track_a_json:
+        args.track_a_json.write_text(metrics.track_a_json(stats), encoding="utf-8")
+    if args.trades_json:
+        args.trades_json.write_text(_trades_json(result), encoding="utf-8")
+
+    for item in stats:
+        print(_track_a_line(item), file=sys.stderr)
+
+
+def _trades_json(result: engine.EngineResult) -> str:
+    payload = {
+        "trades": {
+            name: [trade.as_dict() for trade in rows] for name, rows in result.trades.items()
+        },
+        "skipped": {
+            name: [entry.as_dict() for entry in rows] for name, rows in result.skipped.items()
+        },
+    }
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+
+def _track_a_line(stats: metrics.TrackAStats) -> str:
+    """One line per variant. P13: Strict is reported alongside, not as headline."""
+    label = "" if stats.variant == "base" else f" [{stats.variant} zone variant, not headline]"
+    if not stats.trades:
+        return f"track A {stats.variant}: no trades{label}"
+    return (
+        f"track A {stats.variant}: {stats.trades} trades over {stats.chains} names, "
+        f"win rate {100 * (stats.win_rate or 0):.1f}%, "
+        f"mean {100 * (stats.mean_return or 0):+.2f}%, "
+        f"median {100 * (stats.median_return or 0):+.2f}%, "
+        f"market delta {100 * (stats.market_delta['mean'] or 0):+.2f}%{label}"
+    )
 
 
 def _summary_line(coverage: data.Coverage) -> str:
