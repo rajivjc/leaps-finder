@@ -1,11 +1,11 @@
 """`python -m leaps_scanner.backtest` — manual, local, never a scheduled job.
 
-Through B3: resolve the window, build the point-in-time universe, fill the price
-cache, report §2.4 coverage, then replay §4 over the universe and print §6.1's
-Track A tables for the stock track and for every §5.6 configuration of the LEAP
-overlay. The sleeve arrives in B4, and so does the committed report — §8 puts
-results under `docs/backtest/<run-date>/`, which is B4's deliverable, so this
-command writes nothing unless asked to.
+Resolve the window, build the point-in-time universe, fill the price cache,
+report §2.4 coverage, replay §4 over the universe, print §6.1's Track A tables
+for the stock track and every §5.6 configuration of the LEAP overlay, then run
+§6.2's sleeve and §6.3's benchmarks. §8 puts the committed report under
+`docs/backtest/<run-date>/`; nothing is written unless `--report-dir` asks for
+it, so an exploratory run never touches the repo.
 
 §2.4's floor gates the engine, not just the report: below 80% coverage the run
 is `failed` and computes no statistics, because a headline number over a
@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from leaps_scanner.backtest import data, engine, metrics, synthetic
+from leaps_scanner.backtest import data, engine, metrics, report, sleeve, synthetic
 from leaps_scanner.backtest.membership import Membership
 
 logger = logging.getLogger("leaps_scanner.backtest")
@@ -81,6 +81,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="stock track only; skip §5's synthetic LEAP overlay and its sensitivity grid",
     )
+    parser.add_argument(
+        "--report-dir",
+        type=Path,
+        default=None,
+        help=(
+            "write §8's report.md, results.json and equity SVGs under "
+            "<dir>/<run-date>/ (this is the committed deliverable)"
+        ),
+    )
+    parser.add_argument(
+        "--no-sleeve",
+        action="store_true",
+        help="skip §6.2's sleeve simulation and §6.3's benchmarks",
+    )
     return parser
 
 
@@ -123,10 +137,10 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     coverage = data.compute_coverage(membership, cache, window, run_date=run_date)
-    report = coverage.to_json()
+    coverage_report = coverage.to_json()
     if args.coverage_json:
-        args.coverage_json.write_text(report, encoding="utf-8")
-    print(report, end="")
+        args.coverage_json.write_text(coverage_report, encoding="utf-8")
+    print(coverage_report, end="")
 
     print(_summary_line(coverage), file=sys.stderr)
 
@@ -201,6 +215,113 @@ def _run_engine(
 
     for item in stats:
         print(_track_a_line(item), file=sys.stderr)
+
+    if args.no_sleeve or not overlays:
+        if args.report_dir:
+            logger.error("--report-dir needs the sleeve and the overlay; nothing written")
+        return
+
+    sleeves, benchmarks, calendar, unlabelled = _run_sleeve(
+        result, overlays, cache, window, coverage
+    )
+    for item in sleeves:
+        print(_sleeve_line(item), file=sys.stderr)
+    for item in benchmarks:
+        print(_benchmark_line(item), file=sys.stderr)
+
+    if args.report_dir:
+        directory = args.report_dir / _run_date_of(coverage)
+        written = report.write_report(
+            report.RunInputs(
+                run_date=coverage.run_date,
+                window=window,
+                coverage=coverage,
+                stats=stats,
+                sleeves=sleeves,
+                benchmarks=benchmarks,
+                calendar=calendar,
+                unlabelled_traded=unlabelled,
+            ),
+            directory,
+        )
+        print(f"wrote {len(written)} files to {directory}", file=sys.stderr)
+
+
+def _run_date_of(coverage: data.Coverage) -> str:
+    return coverage.run_date.isoformat()
+
+
+def _run_sleeve(
+    result: engine.EngineResult,
+    overlays: Sequence[synthetic.LeapOverlay],
+    cache: data.PriceCache,
+    window: data.Window,
+    coverage: data.Coverage,
+) -> tuple[
+    tuple[sleeve.SleeveResult, ...],
+    tuple[metrics.BenchmarkResult, ...],
+    tuple[date, ...],
+    int,
+]:
+    """§6.2's sleeves and §6.3's benchmarks, off the base overlay configuration.
+
+    The sleeve runs on `base` alone. §6.2 says "Track A's LEAP-overlay signals"
+    and P9 scopes the E₀ sensitivity to "base (m, h) only", so running it across
+    the §5.6 grid would produce twelve portfolios the spec never asked for and
+    invite a reader to pick the flattering one.
+    """
+    base = next((item for item in overlays if item.name == "base"), overlays[0])
+    trades = base.trades
+
+    sleeves = sleeve.simulate_all(trades, cache, window, coverage=coverage)
+    unlabelled = _traded_without_sector(trades)
+
+    calendar = engine.session_calendar(
+        cache, window, sorted({trade.trade.chain for trade in trades})
+    )
+    entered = sorted({trade.chain for trade in result.trades["base"]})
+    benchmarks = tuple(
+        item
+        for item in (
+            metrics.spy_buy_and_hold(cache, window, coverage=coverage),
+            metrics.equal_weight_entered(entered, cache, window, calendar, coverage=coverage),
+        )
+        if item is not None
+    )
+    return sleeves, benchmarks, tuple(calendar), unlabelled
+
+
+def _traded_without_sector(trades: Sequence[synthetic.SyntheticTrade]) -> int:
+    """How many *traded* names fall into the `Unknown` bucket (bias register 7).
+
+    Counted over the names that actually produced a trade, not over the whole
+    membership: the cap can only bind on a name the sleeve was offered, so the
+    membership-wide gap would overstate what the reader needs to weigh.
+    """
+    labels = sleeve.SectorLabels.load()
+    symbols = {trade.trade.symbol for trade in trades}
+    return sum(1 for symbol in sorted(symbols) if labels.sector_of(symbol) == sleeve.SECTOR_UNKNOWN)
+
+
+def _sleeve_line(item: sleeve.SleeveResult) -> str:
+    warning = (
+        f" [LOW COVERAGE {100 * (item.coverage_ratio or 0):.1f}%]"
+        if item.low_coverage_warning
+        else ""
+    )
+    cagr = "n/a" if item.cagr is None else f"{100 * item.cagr:+.2f}%"
+    drawdown = "n/a" if item.max_drawdown is None else f"{100 * item.max_drawdown:.2f}%"
+    return (
+        f"sleeve {item.name}: ${item.final_equity:,.0f} final, CAGR {cagr}, "
+        f"max DD {drawdown}, {len(item.positions)} positions, "
+        f"{len(item.breaker_dates)} breaker trips{warning}"
+    )
+
+
+def _benchmark_line(item: metrics.BenchmarkResult) -> str:
+    cagr = "n/a" if item.cagr is None else f"{100 * item.cagr:+.2f}%"
+    drawdown = "n/a" if item.max_drawdown is None else f"{100 * item.max_drawdown:.2f}%"
+    return f"benchmark {item.name}: CAGR {cagr}, max DD {drawdown}"
 
 
 def _trades_json(
