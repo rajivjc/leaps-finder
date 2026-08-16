@@ -391,6 +391,39 @@ class TestTargetStrike:
     def test_degenerate_inputs_yield_no_strike(self, spot, sigma, t_years) -> None:
         assert synthetic.target_strike(spot, sigma, 0.02, 0.0, t_years) is None
 
+    def test_an_absurd_dividend_yield_skips_rather_than_raising(self) -> None:
+        """A corrupt payment row must cost one trade, not the whole run.
+
+        yfinance really does emit a payment far larger than the share price; on
+        a 12-cent stock a $100 row gives q ≈ 833, and evaluating e^(qT) to find
+        out that no strike exists would raise `OverflowError` instead of
+        returning the None that means exactly that.
+        """
+        assert synthetic.target_strike(0.12, 0.3, 0.02, 100.0 / 0.12, 1.0) is None
+
+    def test_an_absurd_volatility_skips_rather_than_raising(self) -> None:
+        """σ above ~37.7 overflows the strike's own exponent (e^(σ²/2))."""
+        assert synthetic.target_strike(100.0, 120.0, 0.02, 0.0, 1.0) is None
+        # Just inside the overflow, the strike is still a real number.
+        strike = synthetic.target_strike(100.0, 30.0, 0.02, 0.0, 1.0)
+        assert strike is not None and math.isfinite(strike) and strike > 0
+
+    def test_the_whole_universe_survives_one_corrupt_dividend_row(self, tmp_path: Path) -> None:
+        """The engine-level consequence: a counted skip, not a dead run."""
+        membership, cache = golden_universe(tmp_path)
+        frame = golden_frame()
+        frame[data.DIVIDEND_COLUMN] = frame[data.DIVIDEND_COLUMN].replace(
+            GOLDEN_DIVIDEND, 100_000.0
+        )
+        cache.store("GLD", frame)
+        (overlay,) = synthetic.build_overlays(cache, [synthetic.OverlayConfig("base")])
+
+        result = engine.run(membership, cache, GOLDEN_WINDOW, overlays=[overlay])
+
+        assert overlay.trades == ()
+        assert {entry.reason for entry in overlay.skipped} == {synthetic.SKIP_DELTA_UNREACHABLE}
+        assert len(result.trades["base"]) == 1
+
 
 class TestMarketInputs:
     """§5.1's r and q, as read from the cache."""
@@ -740,6 +773,75 @@ class TestTrackDivergence:
         strict = next(o for o in overlays if o.zone == "strict")
         base = next(o for o in overlays if o.name == "base")
         assert len(strict.trades) < len(base.trades)  # the narrower zone takes fewer
+
+
+class TestNoLookAheadOnTheOverlay:
+    """§9's property test / acceptance 4, extended to the §5 layer.
+
+    B2 asserts this for the stock track. B3 adds three inputs that are indexed
+    by date and could each reach forward — the RV252 window's end, the ^IRX
+    print, and the dividend window — so the same truncation argument has to be
+    made against the overlay's own output, not only against the signals feeding
+    it. Verified by mutation: a dividend window that reaches past the fill, and
+    a rate read thirty prints into the future, both turn this red.
+
+    What truncation *cannot* see is intraday look-ahead, because data kept
+    "through date d" includes d's own close: pricing a fill at d's open off d's
+    close survives every cutoff. That reading — the one the module docstring
+    settles — is pinned by `TestRealizedVolInput`, which perturbs the fill
+    session's close directly. The two tests are complements, not duplicates.
+    """
+
+    @pytest.mark.parametrize("cutoff", [date(2018, 5, 18), date(2019, 7, 12)])
+    def test_truncating_the_input_changes_no_earlier_overlay_decision(
+        self, tmp_path: Path, cutoff: date
+    ) -> None:
+        membership, full_cache = build_fixture(tmp_path / "full")
+        _, cut_cache = build_fixture(tmp_path / "cut")
+        for symbol, frame in fixture_frames().items():
+            cut_cache.store(symbol, frame.loc[: pd.Timestamp(cutoff)])
+
+        window = data.Window(
+            start=date(2017, 1, 2), end=date(2020, 12, 18), fetch_start=date(2015, 1, 1)
+        )
+        (full_overlay,) = synthetic.build_overlays(full_cache, [synthetic.OverlayConfig("base")])
+        (cut_overlay,) = synthetic.build_overlays(cut_cache, [synthetic.OverlayConfig("base")])
+        engine.run(membership, full_cache, window, overlays=[full_overlay])
+        engine.run(
+            membership, cut_cache, dataclasses.replace(window, end=cutoff), overlays=[cut_overlay]
+        )
+
+        def priced(item: synthetic.SyntheticTrade) -> tuple:
+            """Everything §5.1-5.3 decided at the entry fill."""
+            return (
+                item.trade.entry_date,
+                item.trade.entry_price,
+                item.strike,
+                item.sigma,
+                item.rate,
+                item.dividend_yield,
+                item.entry_cost,
+                item.expiry,
+            )
+
+        full = {(t.trade.chain, t.trade.signal_date): t for t in full_overlay.trades}
+        compared = 0
+        for item in cut_overlay.trades:
+            if item.trade.signal_date > cutoff:
+                continue
+            key = (item.trade.chain, item.trade.signal_date)
+            assert key in full, f"the truncated run invented an entry at {key}"
+            assert priced(item) == priced(full[key])
+            # A trade the truncated run had to mark `end_of_window` was not
+            # *decided* — the data simply stopped — so only the exit half is
+            # set aside, exactly as B2's stock-track property test does.
+            if item.trade.exit_reason != "end_of_window" and item.trade.exit_date <= cutoff:
+                assert item.trade.exit_reason == full[key].trade.exit_reason
+                assert item.trade.exit_date == full[key].trade.exit_date
+                assert item.exit_value == full[key].exit_value
+            compared += 1
+
+        assert compared > 5  # a real sweep, not an empty loop
 
 
 class TestSensitivityGrid:

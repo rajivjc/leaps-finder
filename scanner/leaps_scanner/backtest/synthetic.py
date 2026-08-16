@@ -68,6 +68,11 @@ TARGET_DELTA = options.TARGET_DELTA
 # P6: q is the trailing 365 calendar days of cash dividends per share.
 DIVIDEND_LOOKBACK_DAYS = 365
 
+# The largest argument `math.exp` can take before it raises rather than returns
+# (e^709 is finite in float64, e^710 is not). Used to turn an unpriceable input
+# into a counted skip instead of an exception — see `target_strike`.
+_MAX_EXPONENT = 709.0
+
 # Why an overlay entry was not taken. Distinct from §4.3's `no_fill` /
 # `halt_too_long`, which the same skipped list also carries: these say the
 # signal was tradeable but the *vehicle* could not be priced.
@@ -196,16 +201,34 @@ def target_strike(
     so there is no strike to solve for. It is close to reachable on real data:
     the highest trailing-365-day yield in the ten-year universe is about 34.9%,
     a spin-off distorting the dividend sum rather than a real payout.
+
+    Both exponents are checked for representability before `math.exp` evaluates
+    them, because past about 709 it raises `OverflowError` rather than returning
+    a large number. A corrupt dividend row — a $100 payment recorded against a
+    12-cent spot is the shape yfinance actually produces — puts q in the
+    hundreds, and discovering "no strike exists" by way of an exception would
+    abort the whole ten-year run instead of skipping one trade, which is the
+    opposite of what this function's None means and of `options._finite`'s house
+    rule: one bad cell costs one contract, never the scan. The checks bound only
+    that absurd region; the real guard below is still the spec's own
+    `0.70 · e^(qT₀) ≥ 1`, tested on the probability exactly as written, so the
+    threshold itself is unmoved to the last bit.
     """
     if spot <= 0 or sigma <= 0 or t_years <= 0:
         return None
-    probability = target * math.exp(dividend_yield * t_years)
+    carry = dividend_yield * t_years
+    if carry >= _MAX_EXPONENT:
+        return None
+    probability = target * math.exp(carry)
     if probability >= 1.0:
         return None
     d1_star = options.inv_norm_cdf(probability)
-    return spot * math.exp(
-        -(d1_star * sigma * math.sqrt(t_years) - (rate - dividend_yield + sigma**2 / 2) * t_years)
+    exponent = -(
+        d1_star * sigma * math.sqrt(t_years) - (rate - dividend_yield + sigma**2 / 2) * t_years
     )
+    if exponent > _MAX_EXPONENT:
+        return None
+    return spot * math.exp(exponent)
 
 
 class MarketInputs:
