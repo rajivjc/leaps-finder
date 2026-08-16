@@ -62,20 +62,20 @@ GitHub Actions (cron)          Supabase Postgres            Vercel
 │  prices/indicators │  write  │ scan_results     │  read   │  /t/[symbol]     │
 │  fundamentals      ├────────▶│ weekly_bars      │◀────────┤  /compare        │
 │  options + BS delta│         │ iv_snapshots     │         │  /positions      │
-│  scoring           │         │                  │         │  /about          │
-│  exit monitor      │         │ positions    RLS │         └──────────────────┘
-│  daily marks       │         │ alerts       RLS │
+│  scoring           │         ├─ owner only ─────┤         │  /about          │
+│  exit monitor      │         │ positions        │         └──────────────────┘
+│  daily marks       │         │ alerts           │
 └────────────────────┘         │ position_marks   │         server components,
                                │ user_settings    │         precomputed rows only
    weekly: full scan (Sat)     └──────────────────┘
    daily:  refresh + exits
 ```
 
-Everything above the rule in that middle column is public: the scanner writes it with the service
-key from Actions secrets, and anyone may read it. Nothing else can write it at all, which is
-enforced by the absence of an insert policy rather than by trust.
+Everything above the `owner only` rule is public: the scanner writes it with the service key from
+Actions secrets, and anyone may read it. Nothing else can write it at all, which is enforced by
+the absence of an insert policy rather than by trust.
 
-Below the rule, ownership decides. The owner writes their own `positions` and `user_settings`
+Below that rule, ownership decides. The owner writes their own `positions` and `user_settings`
 straight from the browser under `auth.uid() = user_id`; the scanner writes `alerts` and
 `position_marks` on their behalf and the owner only reads them back — acknowledging an alert is
 the single exception. The anon key the browser ships with is powerless outside those policies,
@@ -155,9 +155,20 @@ Two crons keep the data current, and both report through the badges at the top o
 | **Weekly scan** | Saturdays 02:00 UTC | Full pipeline: universe, prices, fundamentals, chains, scoring, weekly exit rules |
 | **Daily refresh** | Weekdays 22:30 UTC | Quotes, IV snapshots, and the daily exit rules; doubles as the Supabase keep-alive |
 
-A run exits non-zero whenever its scan row is recorded as `failed`, so the badge going red is the
-alerting mechanism — there is no inbox to check. A scan that loses more than a fifth of the
-universe fails rather than publishing thinned-out results, and the screener will not display it.
+The badge going red is the alerting mechanism — there is no inbox to check. It means the run
+exited non-zero, which happens in two distinct cases that need different responses.
+
+**The scan row says `failed`.** The screener data is incomplete: a run that loses more than a
+fifth of the universe is recorded as failed rather than publishing thinned-out results, and the
+app will not display it. The site keeps serving the last good scan.
+
+**The scan row says `ok` and the run still exited non-zero.** The screener data is fine; §7's
+exit monitor is what fell short, because a rule could not be evaluated for an open position. This
+case leaves `status = 'ok'` deliberately — the app only ever displays an `ok` scan, so marking it
+failed would blank the public site over one held position — and puts the detail in the scan's
+`notes` and the job's stderr instead. Do not read a red badge over an `ok` row as spurious: it
+means an exit signal may have been missed, which is the one thing that must never be inferred
+from silence.
 
 The daily cron runs `1-5` rather than SPEC.md §9's literal `2-6`. At 22:30 UTC there is no date
 rollover, so `2-6` would cover Tuesday through Friday's US closes plus a Saturday with no session
