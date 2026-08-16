@@ -127,20 +127,49 @@ screener but cannot complete a magic link.
 
 ## Deploying
 
-The web app deploys to Vercel from `apps/web`. There is deliberately no `vercel.json`: the only
-setting this monorepo needs is the root directory, which is a project setting rather than a file,
-and an otherwise-empty config committed next to it would just be a second place to look.
+The web app deploys to Vercel from `apps/web`.
+
+> **Forking this?** `apps/web/vercel.json` pins the serverless region to `sin1` (Singapore)
+> because that is where *this* project's Supabase lives. **Change it to match your own database's
+> region before you deploy** — a mismatch is the difference between a screener that renders in
+> under a second and one that takes three, and it fails slowly and silently rather than loudly.
+> Vercel's region codes are in [their docs](https://vercel.com/docs/edge-network/regions).
 
 1. **New Project** → import this repository.
 2. Set **Root Directory** to `apps/web`. Next.js, the build command, and the output directory are
    then detected automatically. Skipping this step is the one way to get a build that fails at
    "no framework detected".
-3. Add the two public environment variables from [docs/SETUP.md §6](docs/SETUP.md) —
+3. Set the region in `apps/web/vercel.json` to your Supabase project's region, per the note above.
+4. Add the two public environment variables from [docs/SETUP.md §6](docs/SETUP.md) —
    `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. The publishable key only; the
    secret key never touches Vercel.
-4. Add `https://<your-domain>/auth/callback` to Supabase's **Authentication → URL Configuration →
+5. Add `https://<your-domain>/auth/callback` to Supabase's **Authentication → URL Configuration →
    Redirect URLs**, alongside the localhost entry. Until it is there, sign-in works locally and
    fails in production.
+
+### Why the region is pinned
+
+Vercel defaults new projects to `iad1` (US East) regardless of where the database is, and every
+page here except `/about` has to reach Supabase before it can render. Deployed at that default
+against a Singapore database, the screener served in **2.1–3.7s** against
+[SPEC.md §10](SPEC.md)'s "screener loads < 1s".
+
+Two measurements identified the distance as the cause rather than the code. The response header
+read `x-vercel-id: sin1::iad1::…` — the request entering at the Singapore edge and the function
+executing in Virginia — while Supabase answered a query in **39ms** from Singapore over a reused
+connection. `loadScreener` issues three sequential round trips (`scans`, then `scan_results`, then
+`tickers` and `weekly_bars` together), so at the default region each one paid a cross-Pacific
+crossing, plus a fresh TLS handshake on cold connections, instead of tens of milliseconds.
+
+Two caveats worth knowing before treating this as a total fix. `regions` governs the serverless
+functions, so it does not necessarily cover `proxy.ts`, which refreshes the session on **every**
+matched request and awaits one `getUser()` call against Supabase before the page function runs.
+And the region only co-locates the function with the database — a visitor far from that region
+still pays their own distance to it. What the pin removes is the round trip that was paid per
+query on every data-backed page.
+
+Keeping it in a committed file rather than a dashboard setting means the constraint is visible to
+anyone reading the repo, and shows up in review when it changes.
 
 The build runs without Supabase configured — CI proves this on every pull request — so a missing
 variable surfaces as an "unconfigured" notice on the page rather than a failed deploy. That is
