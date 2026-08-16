@@ -222,9 +222,6 @@ class PriceCache:
             return None
         return pd.read_parquet(path).sort_index()
 
-    def has_rates(self) -> bool:
-        return self._path(self.prices_dir, RATE_SYMBOL).exists()
-
     def load_rates(self) -> pd.DataFrame | None:
         """^IRX history, for §5's r input."""
         return self.load(RATE_SYMBOL)
@@ -266,6 +263,23 @@ class PriceCache:
             merged = paid if held is None else pd.concat([held, paid])
             merged = merged[~merged.index.duplicated(keep="last")].sort_index()
             merged.to_parquet(self._path(self.dividends_dir, symbol))
+
+
+def series_is_current(entries: dict, symbol: str, wanted: DateRange) -> bool:
+    """True when the cache holds `symbol` over the whole wanted range (§3.5).
+
+    Existence is deliberately not the test. A tail fetch that fails leaves last
+    week's file exactly where it was, so a benchmark checked for presence alone
+    reports healthy while its history stops short of the window end — which is
+    the failure this module moved the auxiliary series onto the batched path to
+    avoid, and it would silently shorten §6.3.1's buy-and-hold rather than
+    announce itself. The manifest already records what range each symbol was
+    successfully fetched over, so that is what gets checked.
+    """
+    entry = entries.get(symbol)
+    if entry is None or not entry.get("rows"):
+        return False
+    return date.fromisoformat(entry["requested_end"]) >= wanted.end
 
 
 @dataclass(frozen=True)
@@ -393,6 +407,17 @@ def fill_cache(
         """
 
         def record(fetched: dict[str, pd.DataFrame], batch: Sequence[str]) -> None:
+            # A top-up batch that returned *nothing* is a failed request, not
+            # evidence that none of these symbols traded: `fetch_batched` has
+            # already retried it three times and given up. Advancing
+            # `requested_end` here would file the failure as "asked, nothing
+            # new" and leave a stale series wearing a fresh-looking range. A
+            # symbol that genuinely stopped trading shows up the other way —
+            # absent from a batch that otherwise came back — and that case does
+            # advance, so it is not chased again every week.
+            if topping_up and not fetched:
+                return
+
             for symbol in batch:
                 frame = fetched.get(symbol)
                 if frame is not None:
@@ -440,13 +465,20 @@ def fill_cache(
     outcome = run(plan.full, wanted, topping_up=False)
     tail_outcome = run(plan.tail, plan.tail_range or wanted, topping_up=True)
 
-    rates_ok = cache.has_rates()
-    benchmark_ok = cache.load_benchmark() is not None
+    # Checked against the entries this run just wrote, not the manifest read at
+    # the top: a tail that failed leaves the older entry in place, which is
+    # exactly the state these flags exist to catch.
+    rates_ok = series_is_current(entries, RATE_SYMBOL, wanted)
+    benchmark_ok = series_is_current(entries, BENCHMARK_SYMBOL, wanted)
     if not rates_ok:
-        logger.warning("%s history unavailable; r inputs will be missing", RATE_SYMBOL)
+        logger.warning(
+            "%s history does not reach %s; r inputs will be missing", RATE_SYMBOL, wanted.end
+        )
     if not benchmark_ok:
         logger.warning(
-            "%s history unavailable; benchmark comparisons will be missing", BENCHMARK_SYMBOL
+            "%s history does not reach %s; benchmark comparisons will be missing",
+            BENCHMARK_SYMBOL,
+            wanted.end,
         )
 
     # A symbol that failed on an earlier pass and succeeded on this one has to
@@ -700,6 +732,7 @@ def compute_coverage(
         no_data_members=no_data,
         uncovered=tuple(uncovered),
         auxiliary=tuple(
-            (symbol, cache.load(symbol) is not None) for symbol in sorted(AUXILIARY_SYMBOLS)
+            (symbol, series_is_current(manifest.get("symbols", {}), symbol, window.fetch_range))
+            for symbol in sorted(AUXILIARY_SYMBOLS)
         ),
     )

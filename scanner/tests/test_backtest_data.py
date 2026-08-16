@@ -400,27 +400,53 @@ class TestWeeklyRerun:
         assert [call for call in asked if call[0] == ("AAA",)] == asked[:1]
 
     def test_a_symbol_that_stopped_trading_is_not_re_asked_every_run(self, tmp_path):
-        # A name delisted mid-window has no tail to give. Recording that we asked
-        # over the new range stops it being chased again next week, while a
-        # symbol with no rows at all is still retried (that is the ambiguous one).
+        # A name delisted mid-window has no tail to give, and shows it by being
+        # absent from a batch that otherwise came back. Recording that we asked
+        # over the new range stops it being chased again next week.
+        cache = data.PriceCache(tmp_path)
+        first = data.evaluation_window(date(2026, 8, 16))
+        second = data.evaluation_window(date(2026, 8, 23))
+
+        universe = ["AAA", "BBB", "CCC"]
+
+        def downloader(symbols, request):
+            # BBB stops trading after the first window; the others keep going,
+            # so the batch still returns — which is what makes BBB's silence
+            # meaningful rather than just a failed request.
+            served = [s for s in symbols if s != "BBB" or request.start < first.end]
+            sessions = len(pd.bdate_range(start=request.start, end=request.end))
+            return frame(served, sessions=sessions, start=request.start.isoformat())
+
+        self.fill(cache, universe, downloader, date(2026, 8, 16), first)
+        rows = len(cache.load("BBB"))
+        self.fill(cache, universe, downloader, date(2026, 8, 23), second)
+
+        assert cache.read_manifest()["failed"] == []  # an empty tail is not a failure
+        assert len(cache.load("BBB")) == rows  # and it did not lose its history
+        summary = self.fill(cache, universe, downloader, date(2026, 8, 23), second)
+        assert summary.reused == ("AAA", "BBB", "CCC")
+
+    def test_a_tail_batch_that_returns_nothing_is_asked_again(self, tmp_path):
+        # The other side of the same coin: a whole batch coming back empty is a
+        # failed request, not a universe that stopped trading at once. Advancing
+        # the cached range there would hide stale data behind a fresh range.
         cache = data.PriceCache(tmp_path)
         first = data.evaluation_window(date(2026, 8, 16))
         second = data.evaluation_window(date(2026, 8, 23))
 
         def downloader(symbols, request):
-            if request.start >= first.end:  # the tail request: nothing left
+            if request.start >= first.end:
                 return pd.DataFrame()
             sessions = len(pd.bdate_range(start=request.start, end=request.end))
             return frame(list(symbols), sessions=sessions, start=request.start.isoformat())
 
         self.fill(cache, ["AAA"], downloader, date(2026, 8, 16), first)
-        rows = len(cache.load("AAA"))
         self.fill(cache, ["AAA"], downloader, date(2026, 8, 23), second)
+        entry = cache.read_manifest()["symbols"]["AAA"]
 
-        assert cache.read_manifest()["failed"] == []  # an empty tail is not a failure
-        assert len(cache.load("AAA")) == rows  # and it did not lose its history
+        assert entry["requested_end"] == first.end.isoformat()  # not advanced
         summary = self.fill(cache, ["AAA"], downloader, date(2026, 8, 23), second)
-        assert summary.reused == ("AAA",)
+        assert summary.reused == ()  # so it is retried rather than trusted
 
 
 class TestCoverage:
@@ -649,10 +675,14 @@ class TestRenamePricing:
             )
         )
 
-        assert (
-            self.coverage(cache, members).covered_member_weeks
-            < len(data.week_endings(self.window.start, self.window.end)) * 2
-        )
+        coverage = self.coverage(cache, members)
+
+        # Exact, not a bound: the fixture has 4 member-weeks (2 for OLD, 2 for
+        # NEW) and only NEW's are covered without the alias. A loose "fewer than
+        # all" assertion would hold for every possible result, including a
+        # regression that priced unaliased spans from a successor.
+        assert (coverage.covered_member_weeks, coverage.total_member_weeks) == (2, 4)
+        assert {u.symbol for u in coverage.uncovered} == {"OLD"}
 
     def test_the_successors_later_sessions_do_not_count_for_the_old_symbol(self, tmp_path):
         # The cutoff. NEW trades all month; OLD left on the 20th, so OLD must
@@ -792,6 +822,46 @@ class TestBenchmark:
         assert data.BENCHMARK_SYMBOL in summary.topped_up
         assert cache.load_benchmark().index[-1] > before
 
+    def test_a_stale_benchmark_is_not_reported_as_healthy(self, tmp_path):
+        # The regression this check exists for: a tail fetch that fails leaves
+        # last week's file in place. Testing for the file's presence would call
+        # that healthy and let §6.3.1's buy-and-hold run over a series that
+        # never reaches the window end.
+        first = data.evaluation_window(date(2026, 8, 16))
+        second = data.evaluation_window(date(2026, 8, 23))
+
+        def healthy(symbols, request):
+            sessions = len(pd.bdate_range(start=request.start, end=request.end))
+            return frame(list(symbols), sessions=sessions, start=request.start.isoformat())
+
+        def tail_fails(symbols, request):
+            return pd.DataFrame() if request.start >= first.end else healthy(symbols, request)
+
+        cache = data.PriceCache(tmp_path)
+        common = dict(throttle=no_throttle(), sleeper=lambda _: None, rng=random.Random(0))
+        data.fill_cache(
+            ["AAA"], first, cache, run_date=date(2026, 8, 16), downloader=healthy, **common
+        )
+        summary = data.fill_cache(
+            ["AAA"], second, cache, run_date=date(2026, 8, 23), downloader=tail_fails, **common
+        )
+
+        assert cache.load_benchmark() is not None  # the stale file is still there
+        assert not summary.benchmark_ok  # but the run does not call it healthy
+        assert not summary.rates_ok
+        assert cache.read_manifest()["benchmark_cached"] is False
+
+    def test_the_coverage_report_agrees_a_stale_series_is_not_current(self, tmp_path):
+        entries = {"SPY": {"rows": 10, "requested_end": "2026-08-14"}}
+        wanted = data.DateRange(start=date(2015, 2, 11), end=date(2026, 8, 21))
+
+        assert not data.series_is_current(entries, "SPY", wanted)
+        assert data.series_is_current(
+            {"SPY": {"rows": 10, "requested_end": "2026-08-21"}}, "SPY", wanted
+        )
+        assert not data.series_is_current({"SPY": {"rows": 0}}, "SPY", wanted)
+        assert not data.series_is_current({}, "SPY", wanted)
+
     def test_a_missing_benchmark_is_reported_not_fatal(self, tmp_path):
         def downloader(symbols, request):
             return frame([s for s in symbols if s != data.BENCHMARK_SYMBOL])
@@ -814,9 +884,13 @@ class TestBenchmark:
 
     def test_the_benchmark_never_enters_the_coverage_ratio(self, tmp_path):
         cache = data.PriceCache(tmp_path)
+        entries = {}
         for symbol in ("AAA", data.BENCHMARK_SYMBOL, data.RATE_SYMBOL):
             cache.store(symbol, frame([symbol], sessions=20, start="2020-01-06"))
-        cache.write_manifest({"schema": data.CACHE_SCHEMA, "snapshot_date": "2020-02-01"})
+            entries[symbol] = {"rows": 20, "requested_end": "2020-01-31"}
+        cache.write_manifest(
+            {"schema": data.CACHE_SCHEMA, "snapshot_date": "2020-02-01", "symbols": entries}
+        )
         members = Membership(spans=(MembershipSpan("AAA", date(2019, 1, 1), None),))
 
         coverage = data.compute_coverage(
