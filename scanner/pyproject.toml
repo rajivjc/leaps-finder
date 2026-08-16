@@ -8,6 +8,7 @@ dependencies = [
     "curl_cffi>=0.7",
     "pandas>=2.2",
     "numpy>=1.26",
+    "pyarrow>=16.0",  # Parquet cache for the backtest (SPEC-BACKTEST.md §3.4)
     "scipy>=1.13",
     "supabase>=2.15",
     "python-dotenv>=1.0",
@@ -42,3 +43,6 @@ addopts = "-q"
 
 [tool.setuptools.package-data]
 "leaps_scanner.data" = ["*.csv"]
+# `backtest/data/` is deliberately not a package (it would shadow `backtest/data.py`),
+# so its CSV ships as package data of `backtest` itself.
+"leaps_scanner.backtest" = ["data/*.csv"]

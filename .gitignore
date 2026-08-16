@@ -20,6 +20,9 @@ out/
 *.tsbuildinfo
 next-env.d.ts
 
+# Backtest price cache: raw Yahoo data, never committed (size; Yahoo terms).
+.backtest-cache/
+
 # OS
 .DS_Store
 

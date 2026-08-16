@@ -1,4 +1,4 @@
-.PHONY: setup lint test scan refresh web ci
+.PHONY: setup lint test scan refresh backtest web ci
 
 VENV := scanner/.venv
 PY := $(VENV)/bin/python
@@ -23,6 +23,11 @@ scan:
 
 refresh:
 	cd scanner && ../$(VENV)/bin/python -m leaps_scanner.run_scan refresh
+
+# SPEC-BACKTEST.md's analysis: manual local runs only, never a cron job. The
+# first run is a 30-45 min network-bound fetch; later ones read the local cache.
+backtest:
+	cd scanner && ../$(VENV)/bin/python -m leaps_scanner.backtest
 
 web:
 	cd apps/web && npm run dev

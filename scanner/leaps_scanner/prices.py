@@ -29,7 +29,12 @@ BACKOFF_JITTER_SECONDS = 0.5
 
 OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
-Downloader = Callable[[Sequence[str], str], pd.DataFrame]
+# A batch download is described by a request object the batching machinery never
+# inspects — a `period` string for the live scanner, a start/end date range for
+# the backtest (SPEC-BACKTEST.md §3.3, which no `period` string can express).
+Request = object
+Downloader = Callable[[Sequence[str], Request], pd.DataFrame]
+Splitter = Callable[[pd.DataFrame, Sequence[str]], dict[str, pd.DataFrame]]
 
 
 class Throttle:
@@ -89,14 +94,14 @@ def shared_session():
     return curl_cffi.requests.Session(impersonate="chrome")
 
 
-def yahoo_downloader(symbols: Sequence[str], period: str) -> pd.DataFrame:
+def yahoo_downloader(symbols: Sequence[str], period: Request) -> pd.DataFrame:
     """Default downloader: one batched yfinance request over a curl_cffi session."""
     import yfinance as yf
 
     session = shared_session()
     return yf.download(
         tickers=list(symbols),
-        period=period,
+        period=period,  # type: ignore[arg-type]  # v1 always passes a period string
         interval="1d",
         group_by="ticker",
         auto_adjust=False,
@@ -107,12 +112,24 @@ def yahoo_downloader(symbols: Sequence[str], period: str) -> pd.DataFrame:
     )
 
 
-def split_batch_frame(frame: pd.DataFrame, symbols: Sequence[str]) -> dict[str, pd.DataFrame]:
-    """Split a batched download into one clean OHLCV frame per symbol.
+def split_batch_frame(
+    frame: pd.DataFrame,
+    symbols: Sequence[str],
+    *,
+    required: Sequence[str] = OHLCV_COLUMNS,
+    optional: Sequence[str] = (),
+) -> dict[str, pd.DataFrame]:
+    """Split a batched download into one clean frame per symbol.
 
     yfinance returns MultiIndex columns for several symbols and flat columns for
     one, so both shapes are handled. Symbols with no usable rows are omitted
     rather than returned as empty frames.
+
+    A symbol missing any `required` column is dropped — a frame without the
+    columns the caller asked for is not a usable frame. `optional` columns are
+    kept when present and simply absent otherwise, which is how the backtest
+    treats `Dividends`: a symbol that never paid one may come back without the
+    column at all (SPEC-BACKTEST.md §3.3).
     """
     frames: dict[str, pd.DataFrame] = {}
     if frame is None or frame.empty:
@@ -126,28 +143,42 @@ def split_batch_frame(frame: pd.DataFrame, symbols: Sequence[str]) -> dict[str, 
         else:
             per_symbol = frame
 
-        if not set(OHLCV_COLUMNS).issubset(per_symbol.columns):
+        if not set(required).issubset(per_symbol.columns):
             continue
 
-        cleaned = per_symbol[OHLCV_COLUMNS].dropna(subset=["Close"]).sort_index()
+        keep = list(required) + [column for column in optional if column in per_symbol.columns]
+        cleaned = per_symbol[keep].dropna(subset=["Close"]).sort_index()
         if not cleaned.empty:
             frames[symbol] = cleaned
 
     return frames
 
 
-def fetch_daily_ohlcv(
+def fetch_batched(
     symbols: Iterable[str],
     *,
-    period: str = DEFAULT_PERIOD,
+    request: Request,
     batch_size: int = BATCH_SIZE,
-    downloader: Downloader = yahoo_downloader,
+    downloader: Downloader,
+    splitter: Splitter = split_batch_frame,
     throttle: Throttle | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     rng: random.Random | None = None,
     max_retries: int = MAX_RETRIES,
+    on_batch: Callable[[dict[str, pd.DataFrame], Sequence[str]], None] | None = None,
 ) -> FetchOutcome:
-    """Fetch daily history for every symbol, batched and throttled.
+    """Fetch history for every symbol, batched and throttled.
+
+    The batching, throttling and retry discipline SPEC.md §9 pins lives here and
+    nowhere else; what varies between callers is what a batch *asks for*
+    (`request`, handed to the downloader untouched) and how the response is cut
+    into per-symbol frames (`splitter`). The backtest's dated, dividend-carrying
+    fetch is a different request and splitter over this same loop — not a second
+    copy of it.
+
+    `on_batch` is called with each batch's frames as soon as they arrive, so a
+    long fetch can persist progress rather than holding everything in memory
+    until the end and losing it all to an interruption.
 
     A batch that fails every attempt contributes its symbols to `failed`; one
     bad batch never aborts the run, because a scan that covers most of the
@@ -163,8 +194,9 @@ def fetch_daily_ohlcv(
     for batch in batched(ordered, batch_size):
         fetched = _fetch_batch_with_retries(
             batch,
-            period=period,
+            request=request,
             downloader=downloader,
+            splitter=splitter,
             throttle=limiter,
             sleeper=sleeper,
             rng=jitter,
@@ -172,8 +204,34 @@ def fetch_daily_ohlcv(
         )
         frames.update(fetched)
         failed.extend(symbol for symbol in batch if symbol not in fetched)
+        if on_batch is not None:
+            on_batch(fetched, batch)
 
     return FetchOutcome(frames=frames, failed=tuple(failed))
+
+
+def fetch_daily_ohlcv(
+    symbols: Iterable[str],
+    *,
+    period: str = DEFAULT_PERIOD,
+    batch_size: int = BATCH_SIZE,
+    downloader: Downloader = yahoo_downloader,
+    throttle: Throttle | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    rng: random.Random | None = None,
+    max_retries: int = MAX_RETRIES,
+) -> FetchOutcome:
+    """Fetch daily OHLCV over a `period` string — the live scanner's fetch."""
+    return fetch_batched(
+        symbols,
+        request=period,
+        batch_size=batch_size,
+        downloader=downloader,
+        throttle=throttle,
+        sleeper=sleeper,
+        rng=rng,
+        max_retries=max_retries,
+    )
 
 
 def retry_fetch(
@@ -223,8 +281,9 @@ def retry_fetch(
 def _fetch_batch_with_retries(
     batch: Sequence[str],
     *,
-    period: str,
+    request: Request,
     downloader: Downloader,
+    splitter: Splitter,
     throttle: Throttle,
     sleeper: Callable[[float], None],
     rng: random.Random,
@@ -243,11 +302,11 @@ def _fetch_batch_with_retries(
     for attempt in range(max_retries):
         throttle.wait()
         try:
-            raw = downloader(batch, period)
+            raw = downloader(batch, request)
         except Exception as exc:  # noqa: BLE001 - any transport error is retryable
             reason = f"{type(exc).__name__}: {exc}"
         else:
-            fetched = split_batch_frame(raw, batch)
+            fetched = splitter(raw, batch)
             if fetched:
                 return fetched
             reason = "empty response"
