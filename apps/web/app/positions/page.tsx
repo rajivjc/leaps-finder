@@ -1,14 +1,14 @@
 import Link from "next/link";
 
 import { signOut } from "@/app/positions/actions";
-import { AlertsList, CircuitBreakerBanner, activeBreaker } from "@/components/AlertsList";
+import { AlertsList, CircuitBreakerBanner } from "@/components/AlertsList";
 import { EquityForm } from "@/components/EquityForm";
 import { NewPositionForm } from "@/components/NewPositionForm";
 import { Notice } from "@/components/Notice";
 import { ClosedPositions, OpenPositions } from "@/components/PositionList";
 import { SleeveMeters } from "@/components/SleeveMeters";
 import { fmtDate } from "@/lib/format";
-import { sleeveMeters } from "@/lib/metrics";
+import { activeCircuitBreaker, sleeveMeters } from "@/lib/metrics";
 import { loadPositions } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
@@ -60,18 +60,20 @@ export default async function PositionsPage() {
     );
   }
 
-  const { positions, marks, refresh, alerts, tickers, equity, user } = loaded.data;
+  const { positions, marks, refresh, alerts, tickers, sectors, equity, user } = loaded.data;
 
   const open = positions.filter((position) => position.status !== "closed");
   const closed = positions.filter((position) => position.status === "closed");
 
-  const sectorOf = (symbol: string) => tickers[symbol]?.sector ?? null;
+  // Prefer the universe-wide map, falling back to the position's own ticker row
+  // for a held name the last scan no longer covers.
+  const sectorOf = (symbol: string) => sectors[symbol] ?? tickers[symbol]?.sector ?? null;
   const meters = sleeveMeters(open, sectorOf, equity);
 
   // Resolved on the server so form defaults and DTE do not depend on the
   // viewer's clock or timezone — the same reason `fmtDate` pins UTC.
   const today = new Date().toISOString().slice(0, 10);
-  const breaker = activeBreaker(alerts, new Date());
+  const breaker = activeCircuitBreaker(alerts, new Date());
   const unacknowledged = alerts.filter((alert) => !alert.acknowledged).length;
 
   return (
@@ -141,9 +143,7 @@ export default async function PositionsPage() {
       >
         <NewPositionForm
           open={open}
-          sectors={Object.fromEntries(
-            Object.entries(tickers).map(([symbol, ticker]) => [symbol, ticker.sector]),
-          )}
+          sectors={sectors}
           equity={equity}
           today={today}
         />

@@ -6,7 +6,7 @@
  * stays checkable against SPEC.md line by line.
  */
 
-import type { ScanResult } from "@/lib/types";
+import type { Alert, ScanResult } from "@/lib/types";
 
 /** SPEC.md §6: the composite's factor weights, and what each one measures. */
 export const FACTORS = [
@@ -169,6 +169,32 @@ export function daysBetween(from: string, to: string): number {
   const start = Date.parse(`${from}T00:00:00Z`);
   const end = Date.parse(`${to}T00:00:00Z`);
   return Math.round((end - start) / 86_400_000);
+}
+
+/**
+ * The circuit-breaker alert currently in force, if any (SPEC.md §7).
+ *
+ * §7's ban runs four weeks from the day the breaker trips and is not lifted by
+ * the sleeve recovering, so "in force" is a question about the alert's age and
+ * nothing else.
+ *
+ * This lives here rather than beside the banner it drives because the banner is
+ * a client component: every export of a `"use client"` module becomes an opaque
+ * client reference, and a Server Component calling one throws at runtime.
+ */
+export function activeCircuitBreaker<T extends Pick<Alert, "kind" | "created_at">>(
+  alerts: T[],
+  now: Date,
+): T | null {
+  const floor = now.getTime() - CIRCUIT_BREAKER_DAYS * 86_400_000;
+  return (
+    alerts.find(
+      (alert) =>
+        alert.kind === "circuit_breaker" &&
+        alert.created_at !== null &&
+        Date.parse(alert.created_at) > floor,
+    ) ?? null
+  );
 }
 
 export type SectorMeter = { sector: string; count: number; over: boolean };

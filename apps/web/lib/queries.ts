@@ -289,6 +289,15 @@ export type PositionsData = {
   refresh: Scan | null;
   alerts: Alert[];
   tickers: Record<string, Ticker>;
+  /**
+   * `symbol -> sector` for the whole universe, not just held names.
+   *
+   * The entry form needs the sector of the symbol being *typed* to warn about
+   * §7's 2-per-sector cap before the trade is committed — and that symbol is by
+   * definition not among the existing positions, so `tickers` above cannot
+   * supply it. Two columns over ~250 rows is a few kilobytes.
+   */
+  sectors: Record<string, string | null>;
   /** SPEC.md §7's current account equity, or null until the owner enters one. */
   equity: number | null;
 };
@@ -330,7 +339,7 @@ export async function loadPositions(): Promise<Loaded<PositionsData | null>> {
       .toISOString()
       .slice(0, 10);
 
-    const [markRows, alerts, tickers, settings] = await Promise.all([
+    const [markRows, alerts, tickers, sectorRows, settings] = await Promise.all([
       refresh && openIds.length > 0
         ? fetchAllPages<PositionMark>((from, to) =>
             client
@@ -355,6 +364,9 @@ export async function loadPositions(): Promise<Loaded<PositionsData | null>> {
         client,
         positions.map((row) => row.symbol),
       ),
+      fetchAllPages<{ symbol: string; sector: string | null }>((from, to) =>
+        client.from("tickers").select("symbol,sector").order("symbol").range(from, to),
+      ),
       client.from("user_settings").select("*").eq("user_id", user.id).maybeSingle(),
     ]);
 
@@ -369,6 +381,7 @@ export async function loadPositions(): Promise<Loaded<PositionsData | null>> {
         refresh,
         alerts,
         tickers,
+        sectors: Object.fromEntries(sectorRows.map((row) => [row.symbol, row.sector])),
         equity: settings.data?.account_equity ?? null,
       },
     };

@@ -12,12 +12,16 @@
  * Acknowledging writes `acknowledged` and nothing else. Migration 0002 revokes
  * table-wide UPDATE on `alerts` and grants it back on that one column, so the
  * scanner's record of *why* it fired is not the owner's to revise.
+ *
+ * Deciding *whether* a breaker is in force lives in `lib/metrics.ts`, not here:
+ * this is a `"use client"` module, so every one of its exports is a client
+ * reference, and the Server Component that renders the banner cannot call one.
  */
 
 import { acknowledgeAlert } from "@/app/positions/actions";
 import { ActionForm, SubmitButton } from "@/components/ActionForm";
 import { EM_DASH, fmtDate } from "@/lib/format";
-import { CIRCUIT_BREAKER_DAYS, CIRCUIT_BREAKER_WEEKS } from "@/lib/metrics";
+import { CIRCUIT_BREAKER_WEEKS } from "@/lib/metrics";
 import type { Alert, AlertKind, Position } from "@/lib/types";
 
 const LABELS: Record<AlertKind, string> = {
@@ -31,18 +35,6 @@ const LABELS: Record<AlertKind, string> = {
 
 /** §7 makes the earnings heads-up informational; the other five are exits. */
 const INFORMATIONAL = new Set<AlertKind>(["earnings_soon"]);
-
-export function activeBreaker(alerts: Alert[], now: Date): Alert | null {
-  const floor = now.getTime() - CIRCUIT_BREAKER_DAYS * 86_400_000;
-  return (
-    alerts.find(
-      (alert) =>
-        alert.kind === "circuit_breaker" &&
-        alert.created_at !== null &&
-        Date.parse(alert.created_at) > floor,
-    ) ?? null
-  );
-}
 
 export function CircuitBreakerBanner({ alert }: { alert: Alert }) {
   return (

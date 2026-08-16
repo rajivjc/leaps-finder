@@ -175,6 +175,19 @@ class TestBreakerEquity:
     def test_no_positions_yields_none(self):
         assert risk.breaker_equity([]) is None
 
+    def test_a_closed_position_can_supply_the_base(self):
+        # A sleeve that was stopped out and fully closed has no open position to
+        # read equity from — and that is exactly when §7's entry ban matters.
+        closed = position(
+            id=2,
+            status=risk.STATUS_CLOSED,
+            closed_on=AS_OF,
+            exit_premium=1.0,
+            account_equity_at_entry=150_000.0,
+        )
+
+        assert risk.breaker_equity([closed]) == 150_000.0
+
 
 class TestSleevePnl:
     def test_unrealized_uses_the_mark_against_cost_basis(self):
@@ -230,6 +243,61 @@ class TestSleevePnl:
         assert pnl.open_count == 2
         assert pnl.marked_count == 0
         assert not pnl.complete
+
+    def test_a_fully_closed_sleeve_still_has_an_equity_base(self):
+        wipeout = position(
+            id=2,
+            status=risk.STATUS_CLOSED,
+            closed_on=AS_OF - timedelta(days=3),
+            entry_premium=50.0,
+            exit_premium=5.0,
+            contracts=3,
+            account_equity_at_entry=200_000.0,
+        )
+
+        pnl = risk.sleeve_pnl([], [wipeout], {}, AS_OF)
+
+        assert pnl.equity == 200_000.0
+        # (5 − 50) × 3 × 100
+        assert pnl.realized == pytest.approx(-13_500.0)
+        # 13,500 / 200,000 = 6.75% — under the breaker, but measurable, which is
+        # the point: before this it was not measurable at all.
+        assert pnl.loss_fraction == pytest.approx(0.0675)
+
+    def test_a_wiped_out_sleeve_trips_the_breaker_after_everything_is_closed(self):
+        wipeout = position(
+            id=2,
+            status=risk.STATUS_CLOSED,
+            closed_on=AS_OF - timedelta(days=1),
+            entry_premium=50.0,
+            exit_premium=5.0,
+            contracts=5,
+            account_equity_at_entry=200_000.0,
+        )
+
+        pnl = risk.sleeve_pnl([], [wipeout], {}, AS_OF)
+        alert = risk.circuit_breaker_alert(pnl, USER, AS_OF)
+
+        # (5 − 50) × 5 × 100 = −22,500, or 11.25% of 200,000 — past the 8%
+        # breaker. Before the sleeve included closed positions there was no
+        # denominator here at all, and the breaker stayed silent.
+        assert pnl.loss_fraction == pytest.approx(0.1125)
+        assert alert is not None
+        assert "$22,500" in alert.message
+        assert "$200,000" in alert.message
+
+    def test_an_equity_snapshot_outside_the_window_is_not_used(self):
+        # A position closed six months ago is not part of this sleeve; its
+        # realised loss is excluded, so its equity must be too.
+        ancient = position(
+            id=2,
+            status=risk.STATUS_CLOSED,
+            closed_on=AS_OF - timedelta(days=200),
+            exit_premium=1.0,
+            account_equity_at_entry=999_000.0,
+        )
+
+        assert risk.sleeve_pnl([], [ancient], {}, AS_OF).equity is None
 
     def test_a_close_without_an_exit_premium_is_skipped(self):
         unpriced = position(id=2, status=risk.STATUS_CLOSED, closed_on=AS_OF, exit_premium=None)

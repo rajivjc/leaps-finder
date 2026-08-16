@@ -71,10 +71,19 @@ class ScanReport:
     notes: str
     option_failures: int = 0
     fundamentals_failures: int = 0
+    # Scheduled exit rules that could not be evaluated. Kept out of `status`
+    # deliberately (see `_run_full_scan`): the screener data is complete, so the
+    # scan is `ok`, but the run still has to exit non-zero and go red.
+    exit_gaps: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
         return self.status == db.STATUS_OK
+
+    @property
+    def clean(self) -> bool:
+        """Nothing to report at all — the exit code's condition."""
+        return self.ok and not self.exit_gaps
 
 
 @dataclass(frozen=True)
@@ -441,13 +450,25 @@ def _run_full_scan(
         ],
     )
 
+    # Held names are fetched alongside the universe even when they no longer
+    # clear the $50B floor, so §7's weekly exit rule can still be evaluated for
+    # a position the owner actually holds — the same union `_run_daily_refresh`
+    # makes. They are deliberately kept out of everything downstream of this
+    # fetch: a symbol that failed the universe filter must not reappear in
+    # `scan_results` and on the screener just because someone holds it.
+    universe_symbols = {entry.symbol for entry in selected}
+    positions = open_positions(client)
+    held_symbols = {position.symbol for position in positions}
+
     outcome = prices.fetch_daily_ohlcv(
-        [entry.symbol for entry in selected], downloader=downloader, sleeper=sleeper
+        sorted(universe_symbols | held_symbols), downloader=downloader, sleeper=sleeper
     )
     if outcome.failed:
         logger.warning("price fetch failed for %d symbols", len(outcome.failed))
 
-    signals_by_symbol = evaluate_all(outcome.frames)
+    signals_by_symbol = evaluate_all(
+        {symbol: frame for symbol, frame in outcome.frames.items() if symbol in universe_symbols}
+    )
     logger.info("evaluated %d symbols", len(signals_by_symbol))
 
     as_of = resolve_as_of_date(signals_by_symbol) if signals_by_symbol else expected_as_of_date()
@@ -573,7 +594,6 @@ def _run_full_scan(
     # §3.7 / §7: the exit monitor. Only the weekly rule runs here — §7's other
     # five carry a daily cadence and belong to `refresh`, which is the run that
     # has the daily marks they need.
-    positions = open_positions(client)
     monitor = run_exit_monitor(
         client,
         scan_id,
@@ -586,13 +606,20 @@ def _run_full_scan(
             if symbol in outcome.frames
         },
     )
-    if monitor.gaps:
-        # A held name missing from this scan's frames leaves its weekly rule
-        # unrun; that is a coverage failure regardless of the 20% ceiling.
-        status = db.STATUS_FAILED
-        notes = f"exit evaluation incomplete — {'; '.join(monitor.gaps)}. {notes}"
     if monitor.positions:
         notes = f"{notes} {monitor.alerts} alert(s) from {monitor.positions} open position(s)."
+    if monitor.gaps:
+        # Reported loudly — `full_scan` exits non-zero on this, so Actions goes
+        # red — but *not* by marking the scan `failed`.
+        #
+        # `scans.status` answers one question: is this scan's screener data
+        # complete? The web only ever displays a scan that says yes (§9), so
+        # downgrading it here would blank the public screener, ticker and
+        # compare pages until the next clean run — a site-wide outage caused by
+        # one held position's stochastic rule being unrunnable. The scan rows
+        # are complete; it is the exit monitor that fell short, and that belongs
+        # in the exit code and the notes.
+        notes = f"{notes} Exit evaluation incomplete — {'; '.join(monitor.gaps)}."
 
     db.write_scan_results(client, rows)
     # The chart series behind §8.1's sparklines and §8.2's panels, from the same
@@ -627,6 +654,7 @@ def _run_full_scan(
         notes=notes,
         option_failures=len(options_outcome.failed),
         fundamentals_failures=len(funds_outcome.failed),
+        exit_gaps=monitor.gaps,
     )
 
 
@@ -661,7 +689,12 @@ def run_exit_monitor(
     Shared by both entrypoints because the rules are the same rules; only §7's
     cadence column differs, and that arrives as `rules`.
     """
-    if not positions:
+    # With nothing open there are no per-position rules to run — but the
+    # circuit breaker still has to look at recently closed ones. A sleeve that
+    # was stopped out and fully closed is precisely when §7's four-week entry
+    # ban matters, and returning early here would make the breaker unreachable
+    # in that case.
+    if not positions and not (circuit_breaker and closed_positions):
         return ExitMonitorReport(positions=0, alerts=0, gaps=())
 
     ledger = risk.AlertLedger(
@@ -696,14 +729,18 @@ def run_exit_monitor(
                 logger.info("%s (informational)", detail)
 
     if circuit_breaker:
-        for user_id in sorted({position.user_id for position in positions}):
+        owners = {position.user_id for position in positions}
+        owners |= {position.user_id for position in closed_positions}
+        for user_id in sorted(owners):
             mine = [position for position in positions if position.user_id == user_id]
             closed = [position for position in closed_positions if position.user_id == user_id]
             pnl = risk.sleeve_pnl(mine, closed, dict(marks or {}), as_of)
 
             if pnl.equity is None:
+                if not mine and not closed:
+                    continue  # nothing in this owner's sleeve to measure
                 gaps.append(
-                    "circuit breaker not evaluated: no open position carries "
+                    "circuit breaker not evaluated: no position in the sleeve carries "
                     "account_equity_at_entry"
                 )
                 continue
@@ -1077,6 +1114,15 @@ def full_scan() -> int:
     )
     if not report.ok:
         print(f"error: scan recorded as {report.status} — {report.notes}", file=sys.stderr)
+        return 1
+    if report.exit_gaps:
+        # The scan itself is complete and the screener will show it; what failed
+        # is §7's exit monitor, and a missed exit signal must never be inferred
+        # from silence (CLAUDE.md).
+        print(
+            "error: exit evaluation incomplete — " + "; ".join(report.exit_gaps),
+            file=sys.stderr,
+        )
         return 1
     return 0
 

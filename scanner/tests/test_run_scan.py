@@ -48,6 +48,7 @@ class FakeTable:
         self._pending = None
         self._range = None
         self._limit = None
+        self._filters = []
 
     def insert(self, rows):
         self._pending = ("insert", rows)
@@ -66,7 +67,13 @@ class FakeTable:
         return self
 
     def eq(self, column, value):
+        self._filters.append((column, value))
         return self
+
+    def _matches(self, row):
+        # Rows that simply do not carry the filtered column pass through: the
+        # fixtures are partial rows, not full table records.
+        return all(column not in row or row[column] == value for column, value in self._filters)
 
     def gte(self, column, value):
         return self
@@ -98,7 +105,7 @@ class FakeTable:
             raise RuntimeError(f"PostgREST 503 on {self._name}.{verb}")
         self._log.append((self._name, verb, payload))
         if verb == "select":
-            rows = self._select_rows
+            rows = [row for row in self._select_rows if self._matches(row)]
             if self._range is not None:
                 rows = rows[self._range[0] : self._range[1] + 1]
             if self._limit is not None:
@@ -168,6 +175,18 @@ def batch_downloader(frame: pd.DataFrame):
         )
 
     return downloader
+
+
+def drop_symbol(downloader, missing: str):
+    """Wrap a downloader so one symbol comes back with no columns at all —
+    yfinance's way of reporting a failure (an empty result, not an exception)."""
+
+    def wrapped(symbols, period):
+        frame = downloader(symbols, period)
+        keep = [column for column in frame.columns if column[0] != missing]
+        return frame[keep]
+
+    return wrapped
 
 
 def calls_frame(rows) -> pd.DataFrame:
@@ -1185,6 +1204,46 @@ class TestRunDailyRefresh:
         assert closed["status"] == db.STATUS_FAILED
         assert "refresh aborted" in closed["notes"]
 
+    def test_a_sleeve_closed_out_at_a_loss_still_trips_the_breaker(self):
+        # Everything stopped out and closed: no open position, no mark, no
+        # denominator from the open book — and yet this is exactly the moment
+        # §7's four-week entry ban is for.
+        wipeout = position_row(
+            id=9,
+            status="closed",
+            closed_on=(AS_OF - timedelta(days=2)).isoformat(),
+            entry_premium=50.0,
+            exit_premium=5.0,
+            contracts=5,
+            account_equity_at_entry=200_000.0,
+        )
+        client = self.client_with(positions=[wipeout])
+
+        report = self.run(client)
+
+        assert report.positions_count == 0
+        alerts = client.rows("alerts", "insert")[0]
+        breaker = next(row for row in alerts if row["kind"] == "circuit_breaker")
+        assert breaker["position_id"] is None
+        assert breaker["user_id"] == OWNER
+        assert breaker["as_of_date"] == AS_OF.isoformat()
+        assert "$22,500" in breaker["message"]
+
+    def test_a_recovered_sleeve_writes_no_breaker(self):
+        winner = position_row(
+            id=9,
+            status="closed",
+            closed_on=(AS_OF - timedelta(days=2)).isoformat(),
+            entry_premium=20.0,
+            exit_premium=34.0,
+            contracts=2,
+        )
+        client = self.client_with(positions=[winner])
+
+        self.run(client)
+
+        assert client.rows("alerts", "insert") == []
+
     def test_no_positions_means_no_alerts_and_a_clean_run(self):
         client = self.client_with()
 
@@ -1221,12 +1280,12 @@ class TestFullScanExitMonitor:
         client.select_rows["alerts"] = []
         return client
 
-    def run(self, client, frame):
+    def run(self, client, frame, downloader=None):
         return run_scan.run_full_scan(
             client,
             seed=[SeedEntry("AAA", "Alpha", "Information Technology", "Software")],
             market_cap_fetcher=lambda symbol: 900e9,
-            downloader=batch_downloader(frame),
+            downloader=downloader or batch_downloader(frame),
             fundamentals_fetcher=fake_fundamentals,
             expiries_fetcher=fake_expiries,
             chain_fetcher=fake_chain,
@@ -1266,13 +1325,37 @@ class TestFullScanExitMonitor:
 
         assert client.rows("alerts", "insert") == []
 
-    def test_a_held_name_the_scan_never_priced_fails_the_scan(self):
-        client = self.client_holding(symbol="ABSENT")
+    def test_a_held_name_outside_the_universe_is_priced_but_not_scored(self):
+        # §7's weekly rule still has to run for a position the owner holds, even
+        # if the name has since fallen below the $50B floor — but it must not
+        # reappear on the screener as a result.
+        client = self.client_holding(symbol="HELD")
 
         report = self.run(client, rising_frame())
 
-        assert report.status == db.STATUS_FAILED
-        assert "stoch_below_20 not evaluated" in report.notes
+        assert report.status == db.STATUS_OK
+        assert report.exit_gaps == ()
+        written = {
+            row["symbol"] for batch in client.rows("scan_results", "upsert") for row in batch
+        }
+        assert written == {"AAA"}
+
+    def test_an_unpriceable_holding_reports_without_blanking_the_screener(self):
+        # The gap goes to the exit code and the notes, never to `status`:
+        # `latestScan` only ever displays an `ok` scan, so failing the run here
+        # would take the public screener down over one position's rule.
+        client = self.client_holding(symbol="ABSENT")
+
+        report = self.run(
+            client,
+            rising_frame(),
+            downloader=drop_symbol(batch_downloader(rising_frame()), "ABSENT"),
+        )
+
+        assert report.status == db.STATUS_OK
+        assert any("stoch_below_20 not evaluated" in gap for gap in report.exit_gaps)
+        assert "Exit evaluation incomplete" in report.notes
+        assert not report.clean
 
     def test_no_positions_leaves_the_scan_untouched(self):
         client = FakeClient()

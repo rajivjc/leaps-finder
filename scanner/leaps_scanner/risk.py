@@ -261,10 +261,10 @@ class SleevePnl:
         return self.marked_count == self.open_count
 
 
-def breaker_equity(open_positions: Sequence[Position]) -> float | None:
+def breaker_equity(positions: Sequence[Position]) -> float | None:
     """The circuit breaker's denominator: the equity the sleeve was last sized
     against — `account_equity_at_entry` of the most recently opened position
-    still open.
+    in the sleeve.
 
     §7 says "8% of entry equity" while every position carries its own snapshot,
     so the ambiguity has to be resolved somewhere. The newest entry is the
@@ -273,12 +273,18 @@ def breaker_equity(open_positions: Sequence[Position]) -> float | None:
     than the live figure in `user_settings` — it cannot be edited to defuse a
     breaker that has already tripped.
 
+    "The sleeve" deliberately includes positions closed inside the breaker's
+    window, not just open ones. A sleeve that was stopped out and fully closed
+    has no open position to take a denominator from, and that is exactly the
+    moment §7's four-week entry ban exists for — reading the equity only from
+    open positions would leave the breaker silent in its most important case.
+
     Positions opened without an equity snapshot are skipped rather than
-    treated as zero; None means no open position carries one at all.
+    treated as zero; None means no position in the sleeve carries one at all.
     """
     with_equity = [
         position
-        for position in open_positions
+        for position in positions
         if position.account_equity_at_entry is not None and position.account_equity_at_entry > 0
     ]
     if not with_equity:
@@ -308,13 +314,18 @@ def sleeve_pnl(
     """
     since = as_of - timedelta(days=CIRCUIT_BREAKER_DAYS)
 
-    realized = 0.0
-    for position in closed_positions:
-        if position.exit_premium is None or position.closed_on is None:
-            continue
-        if position.closed_on < since:
-            continue
-        realized += position.value_at(position.exit_premium) - position.cost_basis
+    recent_closed = [
+        position
+        for position in closed_positions
+        if position.exit_premium is not None
+        and position.closed_on is not None
+        and position.closed_on >= since
+    ]
+    realized = sum(
+        position.value_at(position.exit_premium) - position.cost_basis
+        for position in recent_closed
+        if position.exit_premium is not None
+    )
 
     unrealized = 0.0
     marked = 0
@@ -326,9 +337,10 @@ def sleeve_pnl(
         unrealized += position.value_at(mark.mid) - position.cost_basis
 
     return SleevePnl(
-        realized=realized,
+        realized=float(realized),
         unrealized=unrealized,
-        equity=breaker_equity(open_positions),
+        # Both halves of the sleeve, so a fully-closed one still has a base.
+        equity=breaker_equity([*open_positions, *recent_closed]),
         open_count=len(open_positions),
         marked_count=marked,
         realized_since=since,
