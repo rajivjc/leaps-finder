@@ -151,22 +151,33 @@ The web app deploys to Vercel from `apps/web`.
 
 Vercel defaults new projects to `iad1` (US East) regardless of where the database is, and every
 page here except `/about` has to reach Supabase before it can render. Deployed at that default
-against a Singapore database, the screener served in **2.1–3.7s** against
-[SPEC.md §10](SPEC.md)'s "screener loads < 1s".
+against a Singapore database, the screener missed
+[SPEC.md §10](SPEC.md)'s "screener loads < 1s" by roughly threefold.
+
+Measured on the deployed site, screener TTFB:
+
+| | `iad1` (default) | `sin1` (pinned) |
+|---|---|---|
+| Warm, median | ~2.7s | **0.39s** |
+| Warm, range | 2.1 – 4.7s | 0.27 – 0.55s |
+| Cold start | — | 1.01s |
 
 Two measurements identified the distance as the cause rather than the code. The response header
 read `x-vercel-id: sin1::iad1::…` — the request entering at the Singapore edge and the function
 executing in Virginia — while Supabase answered a query in **39ms** from Singapore over a reused
 connection. `loadScreener` issues three sequential round trips (`scans`, then `scan_results`, then
 `tickers` and `weekly_bars` together), so at the default region each one paid a cross-Pacific
-crossing, plus a fresh TLS handshake on cold connections, instead of tens of milliseconds.
+crossing, plus a fresh TLS handshake on cold connections, instead of tens of milliseconds. Pinned,
+the header reads `sin1::sin1` and `/t/[symbol]` and `/compare` land around 0.30s too.
 
-Two caveats worth knowing before treating this as a total fix. `regions` governs the serverless
-functions, so it does not necessarily cover `proxy.ts`, which refreshes the session on **every**
-matched request and awaits one `getUser()` call against Supabase before the page function runs.
-And the region only co-locates the function with the database — a visitor far from that region
-still pays their own distance to it. What the pin removes is the round trip that was paid per
-query on every data-backed page.
+Three caveats worth knowing before treating this as a total fix. The **first** request after an
+idle period still measures ~1.0s — right on §10's line — because a serverless cold start pays for
+a fresh connection to Supabase before it can answer; every warm request has roughly 2× headroom.
+`regions` governs the serverless functions, so it does not necessarily cover `proxy.ts`, which
+refreshes the session on **every** matched request and awaits one `getUser()` call against
+Supabase before the page function runs. And the region only co-locates the function with the
+database — a visitor far from that region still pays their own distance to it. What the pin
+removes is the round trip that was paid per query on every data-backed page.
 
 Keeping it in a committed file rather than a dashboard setting means the constraint is visible to
 anyone reading the repo, and shows up in review when it changes.
