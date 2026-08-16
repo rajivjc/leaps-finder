@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="LEAPS Finder">
+  <!-- The long-call payoff: flat while the option is out of the money, then
+       rising past the strike. Filled square rather than a bare stroke so the
+       mark stays legible against both light and dark browser chrome. -->
+  <rect width="32" height="32" rx="7" fill="#171717" />
+  <path
+    d="M6.5 21.5h8.5l9-11.5"
+    fill="none"
+    stroke="#ffffff"
+    stroke-width="2.75"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

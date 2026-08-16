@@ -70,7 +70,7 @@ where relnamespace = 'public'::regnamespace and relkind = 'r'
 order by relname;
 ```
 
-All seven tables must come back `true`:
+All nine tables must come back `true`:
 
 | table | who can read | who can write |
 |---|---|---|
@@ -81,6 +81,13 @@ All seven tables must come back `true`:
 | `iv_snapshots` | anyone | scanner only |
 | `positions` | the owner | the owner |
 | `alerts` | the owner | scanner creates, owner acknowledges |
+| `user_settings` | the owner | the owner |
+| `position_marks` | the owner | scanner only |
+
+The last two arrive with step 4's migration. `user_settings` holds the current account equity the
+size calculator divides by — deliberately separate from `positions.account_equity_at_entry`, which
+is an immutable per-trade snapshot. `position_marks` is the daily bid/ask/mid for each held
+contract, which is what lets the premium stop compare today's mark against the entry premium.
 
 "Scanner only" is enforced by the absence of any insert or update policy: the scanner writes
 with the secret key, which bypasses RLS, and no one else has a way in. Confirm the policies
@@ -162,6 +169,11 @@ Fill in the same two values. The file is gitignored.
 
 Project **Settings → Environment Variables**: `NEXT_PUBLIC_SUPABASE_URL` and
 `NEXT_PUBLIC_SUPABASE_ANON_KEY`. **Publishable key only.**
+
+This is a monorepo, so the project's **Root Directory** must be `apps/web` — the rest of the
+deploy is auto-detected once it is. The full walkthrough, including the redirect URL the
+deployed domain needs back in step 4, is under
+[Deploying in the README](../README.md#deploying).
 
 ### Your laptop again — for `make web`
 
