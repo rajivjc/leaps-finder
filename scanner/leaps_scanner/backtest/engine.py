@@ -21,6 +21,15 @@ from the formulas:
   a press release.
 * **Membership gates entries only** (§4.3a). Leaving the index is not one of
   §4.4's exits, so a position runs on price data until a §4.4 rule fires.
+
+B3 adds a third: **the overlay is a replay of its own, not a decoration of the
+stock track's trades** (`PositionOverlay` below). §4.4 gives `premium_stop` to
+the LEAP overlay alone, so an overlay position can exit earlier than the stock
+position on the same signal — and P8 scopes "one open trade" per *track*, so
+that frees the chain earlier and lets the overlay take a later entry the stock
+track was still holding through. The two tracks' trade sets genuinely differ in
+count and in dates, which is why the overlay runs the same loop again rather
+than annotating the stock trades: one loop, driven twice, cannot drift.
 """
 
 from __future__ import annotations
@@ -29,6 +38,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
+from typing import Protocol
 
 import numpy as np
 import pandas as pd
@@ -53,9 +63,9 @@ BASE_ZONE_HIGH = indicators.ZONE_HIGH
 STRICT_ZONE_HIGH = 55.0
 VARIANTS: Mapping[str, float] = {"base": BASE_ZONE_HIGH, "strict": STRICT_ZONE_HIGH}
 
-# §4.4's priority, most severe first. `premium_stop` belongs to the B3 overlay
-# and sits between `stoch_below_20` and `time_exit` when it arrives.
-EXIT_PRIORITY = ("trend_break", "stoch_below_20", "time_exit")
+# §4.4's priority, most severe first. `premium_stop` belongs to the §5 overlay
+# and never fires on the stock track, which has no premium to halve.
+EXIT_PRIORITY = ("trend_break", "stoch_below_20", "premium_stop", "time_exit")
 
 
 @dataclass(frozen=True)
@@ -370,6 +380,50 @@ def session_calendar(
     return tuple(stamp.date() for stamp in sessions if window.start <= stamp.date() <= window.end)
 
 
+class PositionOverlay(Protocol):
+    """A vehicle layered over the §4 signal, replayed in its own pass (§5).
+
+    The engine drives it and owns none of its arithmetic: it says when a
+    position would open, asks at every close whether the vehicle's own exit rule
+    has fired, and hands over the finished trade. What the overlay records —
+    strikes, premiums, its own skipped entries — is entirely its business, which
+    is what keeps §5's pricing out of this module and §4's event loop out of
+    `synthetic.py`.
+
+    `zone` names the §4.2 variant whose signals this overlay follows, so P13's
+    Strict variant is one more overlay rather than a second code path.
+    """
+
+    name: str
+    zone: str
+
+    def begin_replay(self, panel: Panel) -> None:
+        """Starting a fresh chain: drop any state from the previous one."""
+
+    def open_position(self, panel: Panel, index: int) -> str | None:
+        """Open at this entry fill, or return the reason it cannot be opened.
+
+        A reason is recorded exactly as §4.3's own skips are — logged, counted,
+        and leaving the track free for the next signal (§5.2's domain guard:
+        "the overlay trade is skipped ... the stock-track trade proceeds
+        unaffected").
+        """
+
+    def premium_stopped(self, panel: Panel, index: int) -> bool:
+        """§4.4's `premium_stop`, evaluated at this session's close."""
+
+    def record_exit(self, trade: Trade) -> None:
+        """The position closed as `trade`.
+
+        The trade carries the exit fill in full — date, price and the basis it
+        was taken on — so an overlay values its exit against the same number the
+        stock track booked, not a second lookup that could disagree with it.
+        """
+
+    def record_skipped(self, entries: Sequence[SkippedEntry]) -> None:
+        """Every signal this pass did not trade, from §4.3's causes and §5's."""
+
+
 @dataclass(frozen=True)
 class ChainResult:
     """What one book produced, per §4.2 zone variant."""
@@ -385,12 +439,16 @@ def run_book(
     calendar: Sequence[date],
     *,
     variants: Mapping[str, float] = VARIANTS,
+    overlays: Sequence[PositionOverlay] = (),
 ) -> ChainResult:
-    """Replay §4 over one chain, once per zone variant.
+    """Replay §4 over one chain: once per zone variant, once per overlay.
 
     The variants share the panel deliberately: only `in_zone`'s upper edge
     differs between them (P13), so recomputing the indicators per variant would
-    double the run for a comparison of one threshold.
+    double the run for a comparison of one threshold. §5.6's scope rule makes
+    that sharing normative for the overlay too — m and h touch the synthetic
+    layer only, so every configuration reads the same signals and the same
+    stock-track panel, and only the replay is repeated.
     """
     trades: dict[str, tuple[Trade, ...]] = {}
     skipped: dict[str, tuple[SkippedEntry, ...]] = {}
@@ -398,6 +456,13 @@ def run_book(
         book_trades, book_skipped = _replay(book, panel, window, calendar, zone_high)
         trades[name] = book_trades
         skipped[name] = book_skipped
+
+    for overlay in overlays:
+        _, overlay_skipped = _replay(
+            book, panel, window, calendar, variants[overlay.zone], overlay=overlay
+        )
+        overlay.record_skipped(overlay_skipped)
+
     return ChainResult(trades=trades, skipped=skipped)
 
 
@@ -407,9 +472,13 @@ def _replay(
     window: data.Window,
     calendar: Sequence[date],
     zone_high: float,
+    *,
+    overlay: PositionOverlay | None = None,
 ) -> tuple[tuple[Trade, ...], tuple[SkippedEntry, ...]]:
     """One chronological walk: fills at the open, decisions at the close."""
     sessions = panel.session_dates
+    if overlay is not None:
+        overlay.begin_replay(panel)
     last = _last_session_in_window(sessions, window)
     if last is None:
         return (), ()
@@ -448,29 +517,37 @@ def _replay(
         # -- fills, at the open, from decisions taken at a previous close ------
         if pending_exit is not None and open_trade is not None and pending_exit[2] == index:
             signalled, reason, _ = pending_exit
-            trades.append(
-                _close_trade(
-                    open_trade,
-                    exit_date=today,
-                    exit_price=float(panel.open_[index]),
-                    exit_basis="open",
-                    exit_reason=reason,
-                    exit_signal_date=signalled,
-                )
+            trade = _close_trade(
+                open_trade,
+                exit_date=today,
+                exit_price=float(panel.open_[index]),
+                exit_basis="open",
+                exit_reason=reason,
+                exit_signal_date=signalled,
             )
+            trades.append(trade)
+            if overlay is not None:
+                overlay.record_exit(trade)
             open_trade, pending_exit = None, None
 
         if pending_entry is not None and open_trade is None and pending_entry[2] == index:
             label, signalled, _ = pending_entry
-            open_trade = {
-                "chain": panel.chain,
-                "symbol": book.member_fridays[panel.label_dates[label]],
-                "signal_date": signalled,
-                "entry_date": today,
-                "entry_price": float(panel.open_[index]),
-                "entry_slow_k": float(panel.slow_k[label]),
-            }
             pending_entry = None
+            # §5.2: an overlay that cannot price this entry skips it — counted
+            # like any other skip, and leaving the track free for the next
+            # signal, exactly as §4.3's own skips do.
+            refusal = overlay.open_position(panel, index) if overlay is not None else None
+            if refusal is not None:
+                skip(label, signalled, refusal)
+            else:
+                open_trade = {
+                    "chain": panel.chain,
+                    "symbol": book.member_fridays[panel.label_dates[label]],
+                    "signal_date": signalled,
+                    "entry_date": today,
+                    "entry_price": float(panel.open_[index]),
+                    "entry_slow_k": float(panel.slow_k[label]),
+                }
 
         # -- decisions, at the close ------------------------------------------
         if open_trade is not None:
@@ -486,20 +563,26 @@ def _replay(
                         open_trade["entry_date"],
                     )
                 else:
-                    trades.append(
-                        _close_trade(
-                            open_trade,
-                            exit_date=sessions[mark],
-                            exit_price=float(panel.close[mark]),
-                            exit_basis="close",
-                            exit_reason=final_reason,
-                            exit_signal_date=None,
-                        )
+                    trade = _close_trade(
+                        open_trade,
+                        exit_date=sessions[mark],
+                        exit_price=float(panel.close[mark]),
+                        exit_basis="close",
+                        exit_reason=final_reason,
+                        exit_signal_date=None,
                     )
+                    trades.append(trade)
+                    if overlay is not None:
+                        overlay.record_exit(trade)
                 open_trade = None
                 break
             if pending_exit is None:
-                reason = _exit_reason(panel, index, open_trade["entry_date"])
+                reason = _exit_reason(
+                    panel,
+                    index,
+                    open_trade["entry_date"],
+                    premium_stopped=overlay is not None and overlay.premium_stopped(panel, index),
+                )
                 # No tradeable bar left: §4.3 marks at the last available close,
                 # which is exactly what the `index == last` branch above does, so
                 # the signal is left to fall through to it.
@@ -594,12 +677,21 @@ def _entry_signals(
     return signals
 
 
-def _exit_reason(panel: Panel, index: int, entry_date: date) -> str | None:
-    """§4.4's rules at one session's close, resolved by the pinned priority."""
+def _exit_reason(
+    panel: Panel, index: int, entry_date: date, *, premium_stopped: bool = False
+) -> str | None:
+    """§4.4's rules at one session's close, resolved by the pinned priority.
+
+    `premium_stopped` is decided by the caller's overlay because it is the one
+    rule that is not a property of the price series alone: it needs the position
+    — its premium paid, strike, σ, r, q and expiry. Everything else here reads
+    the panel, which is why the stock track can share this function untouched.
+    """
     label = int(panel.latest_label[index])
     fired = {
         "trend_break": bool(panel.trend_broken[index]),
         "stoch_below_20": bool(label >= 0 and panel.cross_below_exit[label]),
+        "premium_stop": premium_stopped,
         "time_exit": (panel.session_dates[index] - entry_date).days >= TIME_EXIT_DAYS,
     }
     for reason in EXIT_PRIORITY:
@@ -677,12 +769,16 @@ def run(
     window: data.Window,
     *,
     variants: Mapping[str, float] = VARIANTS,
+    overlays: Sequence[PositionOverlay] = (),
 ) -> EngineResult:
     """Replay §4 over the whole point-in-time universe.
 
     Chains are processed one at a time and their panels discarded, because
     holding ~700 decades of daily history plus their derived arrays in memory at
-    once buys nothing: no chain's signals depend on another's.
+    once buys nothing: no chain's signals depend on another's. Every overlay
+    passed in is replayed against the same panel while it is in hand, for the
+    same reason — and it accumulates its own trades, so nothing about §5's
+    output has to travel back through this function's result.
     """
     books = build_books(membership, window)
     calendar = session_calendar(cache, window, [book.chain for book in books])
@@ -699,7 +795,7 @@ def run(
         if panel is None:
             continue
         priced += 1
-        result = run_book(book, panel, window, calendar, variants=variants)
+        result = run_book(book, panel, window, calendar, variants=variants, overlays=overlays)
         for name in variants:
             trades[name].extend(result.trades[name])
             skipped[name].extend(result.skipped[name])

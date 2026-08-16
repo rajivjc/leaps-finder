@@ -65,6 +65,141 @@ class TestBsDelta:
             options.bs_delta(spot, strike, t, 0.04, 0.0, sigma)
 
 
+class TestInvNormCdf:
+    """SPEC-BACKTEST.md §9: `norm_cdf(inv_norm_cdf(p)) = p ± 1e−9`."""
+
+    @pytest.mark.parametrize(
+        "p",
+        [1e-12, 1e-6, 0.001, 0.02424, 0.02425, 0.1, 0.5, 0.7, 0.97575, 0.999, 1 - 1e-9],
+    )
+    def test_round_trips_through_norm_cdf(self, p):
+        assert options.norm_cdf(options.inv_norm_cdf(p)) == pytest.approx(p, abs=1e-9)
+
+    def test_round_trip_holds_across_the_whole_unit_interval(self):
+        """A sweep, not six points: the approximation has three branches and the
+        refinement has to carry all of them, including the seams."""
+        worst = max(
+            abs(options.norm_cdf(options.inv_norm_cdf(i / 5000)) - i / 5000) for i in range(1, 5000)
+        )
+
+        assert worst < 1e-12  # far inside §9's 1e-9, so the seams are not marginal
+
+    @pytest.mark.parametrize(
+        ("p", "expected"),
+        [
+            (0.5, 0.0),
+            (0.975, 1.959963984540054),  # the textbook 95% two-sided quantile
+            (0.95, 1.644853626951472),
+            (0.99, 2.326347874040841),
+            (0.025, -1.959963984540054),
+        ],
+    )
+    def test_matches_published_normal_quantiles(self, p, expected):
+        assert options.inv_norm_cdf(p) == pytest.approx(expected, abs=1e-12)
+
+    def test_is_monotone(self):
+        values = [options.inv_norm_cdf(i / 1000) for i in range(1, 1000)]
+
+        assert values == sorted(values)
+
+    @pytest.mark.parametrize("p", [0.0, 1.0, -0.1, 1.5])
+    def test_probabilities_outside_the_open_unit_interval_are_rejected(self, p):
+        with pytest.raises(ValueError):
+            options.inv_norm_cdf(p)
+
+
+class TestBsCallPrice:
+    """SPEC-BACKTEST.md §9: call prices against published Black-Scholes values.
+
+    SPEC.md §10's reference table covers delta only, so the price references are
+    added here. All three are standard published worked examples: Hull's
+    `S=42, K=40, r=10%, σ=20%, T=0.5` call at 4.76 and his index-option example
+    `S=930, K=900, r=8%, q=3%, σ=20%, T=2/12` at 51.83 (Hull, *Options, Futures
+    and Other Derivatives*), plus the textbook at-the-money one-year case
+    `S=K=100, r=5%, σ=20%` at 10.4506 that appears in essentially every
+    Black-Scholes exposition.
+    """
+
+    @pytest.mark.parametrize(
+        ("spot", "strike", "t", "r", "q", "sigma", "expected", "tolerance"),
+        [
+            (42.0, 40.0, 0.5, 0.10, 0.0, 0.20, 4.76, 0.005),
+            (100.0, 100.0, 1.0, 0.05, 0.0, 0.20, 10.4506, 0.00005),
+            (930.0, 900.0, 2 / 12, 0.08, 0.03, 0.20, 51.83, 0.005),
+        ],
+    )
+    def test_matches_published_references(self, spot, strike, t, r, q, sigma, expected, tolerance):
+        price = options.bs_call_price(spot, strike, t, r, q, sigma)
+
+        assert price == pytest.approx(expected, abs=tolerance)
+
+    def test_satisfies_put_call_parity(self):
+        """An independent identity, not a restatement: parity is derived from
+        no-arbitrage, so agreement pins d2 and both discount factors at once."""
+        spot, strike, t, r, q, sigma = 123.4, 110.0, 0.75, 0.031, 0.017, 0.28
+        call = options.bs_call_price(spot, strike, t, r, q, sigma)
+        d1 = (math.log(spot / strike) + (r - q + sigma**2 / 2) * t) / (sigma * math.sqrt(t))
+        d2 = d1 - sigma * math.sqrt(t)
+        put = strike * math.exp(-r * t) * options.norm_cdf(-d2) - spot * math.exp(
+            -q * t
+        ) * options.norm_cdf(-d1)
+
+        assert call - put == pytest.approx(
+            spot * math.exp(-q * t) - strike * math.exp(-r * t), abs=1e-12
+        )
+
+    def test_matches_the_discounted_expected_payoff(self):
+        """A second, wholly different route to the same number: integrate the
+        payoff against the risk-neutral lognormal density by the trapezium rule.
+        No d1, no d2, no normal CDF — so agreement is not two spellings of one
+        formula agreeing with itself."""
+        spot, strike, t, r, q, sigma = 100.0, 95.0, 1.0, 0.04, 0.01, 0.25
+        drift = (r - q - sigma**2 / 2) * t
+        width = sigma * math.sqrt(t)
+
+        steps = 400_000
+        low, high = drift - 12 * width, drift + 12 * width
+        step = (high - low) / steps
+        total = 0.0
+        for index in range(steps + 1):
+            x = low + index * step
+            density = math.exp(-((x - drift) ** 2) / (2 * width**2)) / (
+                width * math.sqrt(2 * math.pi)
+            )
+            payoff = max(spot * math.exp(x) - strike, 0.0)
+            weight = 0.5 if index in (0, steps) else 1.0
+            total += weight * payoff * density * step
+
+        assert options.bs_call_price(spot, strike, t, r, q, sigma) == pytest.approx(
+            math.exp(-r * t) * total, abs=1e-6
+        )
+
+    def test_deep_itm_approaches_the_discounted_forward_intrinsic(self):
+        price = options.bs_call_price(100.0, 1.0, 1.0, 0.04, 0.02, 0.30)
+
+        assert price == pytest.approx(100 * math.exp(-0.02) - 1 * math.exp(-0.04), abs=1e-9)
+
+    def test_deep_otm_approaches_zero(self):
+        assert options.bs_call_price(100.0, 10_000.0, 1.0, 0.04, 0.0, 0.30) == pytest.approx(
+            0.0, abs=1e-9
+        )
+
+    def test_a_negative_rate_is_priced_rather_than_rejected(self):
+        """^IRX printed negative in March 2020, so §5's r can be below zero.
+        Clamping it would be inventing data; the formula handles it."""
+        price = options.bs_call_price(100.0, 100.0, 1.0, -0.001, 0.0, 0.30)
+
+        assert math.isfinite(price) and price > 0
+
+    @pytest.mark.parametrize(
+        ("spot", "strike", "t", "sigma"),
+        [(0.0, 100, 1, 0.3), (100, 0.0, 1, 0.3), (100, 100, 0.0, 0.3), (100, 100, 1, 0.0)],
+    )
+    def test_degenerate_inputs_are_rejected(self, spot, strike, t, sigma):
+        with pytest.raises(ValueError):
+            options.bs_call_price(spot, strike, t, 0.04, 0.0, sigma)
+
+
 class TestSelectLeapExpiry:
     def test_prefers_the_nearest_expiry_at_or_beyond_350_days(self):
         expiries = [
@@ -282,6 +417,51 @@ class TestRealizedVol:
 
     def test_short_history_yields_none(self):
         assert options.realized_vol_20d(pd.Series([100.0] * 15)) is None
+
+    def test_rv252_matches_a_closed_form_fixture(self):
+        """SPEC-BACKTEST.md §9's hand-computed RV252.
+
+        The fixture alternates log returns +a, −a, so the arithmetic is exact
+        rather than approximate: 252 returns of magnitude `a` about a mean of
+        zero give a sample variance of 252a²/251, hence
+        RV252 = a·√(252/251)·√252 = a·252/√251.
+        """
+        a = 0.013
+        closes = [100.0]
+        for step in range(252):
+            closes.append(closes[-1] * math.exp(a if step % 2 == 0 else -a))
+        expected = a * 252 / math.sqrt(251)
+
+        value = options.realized_vol_20d(pd.Series(closes), window=252)
+
+        assert value == pytest.approx(expected, rel=1e-12)
+
+    def test_rv252_reads_exactly_252_returns_from_the_tail(self):
+        """The window is the *last* 252 returns; older history cannot leak in."""
+        a = 0.02
+        closes = [100.0]
+        for step in range(400):
+            closes.append(closes[-1] * math.exp(a if step % 2 == 0 else -a))
+        # A wildly different early regime, entirely outside the window.
+        noisy = [value * (3.0 if index < 100 else 1.0) for index, value in enumerate(closes)]
+
+        assert options.realized_vol_20d(pd.Series(noisy), window=252) == pytest.approx(
+            a * 252 / math.sqrt(251), rel=1e-12
+        )
+
+    def test_rv252_needs_253_closes(self):
+        closes = pd.Series([100.0 + index for index in range(252)])
+
+        assert options.realized_vol_20d(closes, window=252) is None
+        assert options.realized_vol_20d(pd.Series([*closes, 352.0]), window=252) is not None
+
+    def test_the_default_window_is_still_v1s_twenty_days(self):
+        """§5.1 parameterizes this function; it must not redefine §3.5's RV20."""
+        rng = np.random.default_rng(11)
+        close = pd.Series(100.0 * np.exp(np.cumsum(rng.normal(0, 0.02, 60))))
+
+        assert options.realized_vol_20d(close) == options.realized_vol_20d(close, window=20)
+        assert options.realized_vol_20d(close) != options.realized_vol_20d(close, window=40)
 
 
 class TestEvaluateSymbolOptions:

@@ -1,14 +1,19 @@
-"""Track A statistics for the stock track (SPEC-BACKTEST.md §6.1).
+"""Track A statistics (SPEC-BACKTEST.md §6.1), for both of its tracks.
 
 Per-trade, not per-portfolio: every §4.2 signal counted independently, which is
 the primary result §6 asks for. The sleeve's portfolio arithmetic is §6.2 and
 belongs to B4, and §6.3's buy-and-hold benchmarks are reported beside it there.
 What lands here is what §6.1 pins — the distribution of trade outcomes, and the
-one per-trade benchmark the stock track can carry.
+per-trade benchmarks each track can carry.
 
-§6.1 asks for **no** vehicle alpha on this track, and there is none to compute:
+§6.1 lists one table and reports it "for both the stock track and the LEAP
+overlay", so there is one summarizer here and the track is a field on the
+result. The single asymmetry is deliberate and is §6.1's own: **vehicle alpha is
+reported on the overlay only**. On the stock track there is nothing to compute —
 `r_trade` *is* the same-window hold, so the difference would be zero for every
-trade by construction. Reporting a column of zeros would look like a measurement.
+trade by construction, and a column of zeros would look like a measurement.
+`None` there means "this track has no such quantity", which is a different claim
+from zero and from unmeasured.
 """
 
 from __future__ import annotations
@@ -23,8 +28,12 @@ import pandas as pd
 
 from leaps_scanner.backtest import data
 from leaps_scanner.backtest.engine import SkippedEntry, Trade
+from leaps_scanner.backtest.synthetic import OverlayConfig, SyntheticTrade
 
 RETURN_PERCENTILES = (5, 25, 50, 75, 95)
+
+STOCK_TRACK = "stock"
+OVERLAY_TRACK = "overlay"
 
 
 def _summary(values: np.ndarray) -> dict[str, float | None]:
@@ -53,8 +62,14 @@ def _profit_factor(returns: np.ndarray) -> float | None:
 
 @dataclass(frozen=True)
 class TrackAStats:
-    """§6.1's per-trade table for one §4.2 zone variant."""
+    """§6.1's per-trade table for one track's one variant.
 
+    `variant` names the §4.2 zone variant on the stock track and the §5.6
+    configuration on the overlay; `parameters` carries that configuration's m, h
+    and zone so the sensitivity table can be read off the rows themselves.
+    """
+
+    track: str
     variant: str
     trades: int
     chains: int
@@ -73,6 +88,12 @@ class TrackAStats:
     # thin benchmark shows up as a count rather than as a quietly smaller mean.
     market_delta: Mapping[str, float | None]
     market_delta_unpriced: int
+    # §6.1's vehicle alpha, on the overlay track only — see the module docstring
+    # for why the stock track's is None rather than a column of zeros.
+    vehicle_alpha: Mapping[str, float | None] | None = None
+    # The §5.6 parameters behind an overlay row; None on the stock track, which
+    # has none (m and h touch the synthetic layer only).
+    parameters: Mapping[str, float | str] | None = None
     # §2.4 / acceptance 2: coverage below 85% must put a visible warning on every
     # headline table, and this *is* a headline table. Carried on the statistics
     # rather than left in a log line, so the warning cannot be separated from the
@@ -83,7 +104,9 @@ class TrackAStats:
 
     def as_dict(self) -> dict:
         return {
+            "track": self.track,
             "variant": self.variant,
+            "parameters": None if self.parameters is None else dict(self.parameters),
             "coverage_ratio": self.coverage_ratio,
             "low_coverage_warning": self.low_coverage_warning,
             "trades": self.trades,
@@ -100,6 +123,7 @@ class TrackAStats:
             "skipped_entries": dict(self.skipped_entries),
             "market_delta": dict(self.market_delta),
             "market_delta_unpriced": self.market_delta_unpriced,
+            "vehicle_alpha": None if self.vehicle_alpha is None else dict(self.vehicle_alpha),
         }
 
 
@@ -137,21 +161,27 @@ class BenchmarkPrices:
         return exit_ / entry - 1.0
 
 
-def track_a(
+def _summarize(
+    *,
+    track: str,
     variant: str,
     trades: Sequence[Trade],
+    returns: Sequence[float],
     skipped: Sequence[SkippedEntry],
     benchmark: BenchmarkPrices,
-    *,
-    coverage: data.Coverage | None = None,
+    alphas: Sequence[float] | None,
+    parameters: Mapping[str, float | str] | None,
+    coverage: data.Coverage | None,
 ) -> TrackAStats:
-    """Summarize one variant's trades exactly as §6.1 lists them.
+    """§6.1's table over one track's trades and that track's own returns.
 
-    `coverage` travels with the table on purpose (acceptance 2): a headline
-    statistic and the share of the universe behind it belong to the same object,
-    so no caller can print one without the other.
+    `trades` supplies the windows, the exits and the names; `returns` supplies
+    what the track actually earned over them, which is `r_trade` for the shares
+    and `r_overlay` for the option. Keeping them as two arguments is what lets
+    the overlay be measured against the market on its own return without
+    reimplementing the distribution beside this one.
     """
-    returns = np.array([trade.r_trade for trade in trades], dtype="float64")
+    values = np.array(returns, dtype="float64")
     held = np.array([trade.holding_days for trade in trades], dtype="float64")
 
     exit_reasons: dict[str, int] = {}
@@ -167,37 +197,38 @@ def track_a(
 
     deltas: list[float] = []
     unpriced = 0
-    for trade in trades:
+    for trade, value in zip(trades, values, strict=True):
         hold = benchmark.hold_return(trade)
         if hold is None:
             unpriced += 1
             continue
-        deltas.append(trade.r_trade - hold)
+        deltas.append(float(value) - hold)
     delta_values = np.array(deltas, dtype="float64")
 
-    wins = int(np.sum(returns > 0)) if returns.size else 0
+    wins = int(np.sum(values > 0)) if values.size else 0
     percentiles = (
         {
-            f"p{level}": float(value)
-            for level, value in zip(
+            f"p{level}": float(percentile)
+            for level, percentile in zip(
                 RETURN_PERCENTILES,
-                np.percentile(returns, RETURN_PERCENTILES),
+                np.percentile(values, RETURN_PERCENTILES),
                 strict=True,
             )
         }
-        if returns.size
+        if values.size
         else {f"p{level}": None for level in RETURN_PERCENTILES}
     )
 
     return TrackAStats(
+        track=track,
         variant=variant,
         trades=len(trades),
         chains=len({trade.chain for trade in trades}),
         wins=wins,
         win_rate=(wins / len(trades)) if trades else None,
-        mean_return=float(np.mean(returns)) if returns.size else None,
-        median_return=float(np.median(returns)) if returns.size else None,
-        profit_factor=_profit_factor(returns) if returns.size else None,
+        mean_return=float(np.mean(values)) if values.size else None,
+        median_return=float(np.median(values)) if values.size else None,
+        profit_factor=_profit_factor(values) if values.size else None,
         return_percentiles=percentiles,
         holding_days=_summary(held),
         exit_reasons=dict(sorted(exit_reasons.items())),
@@ -205,12 +236,79 @@ def track_a(
         skipped_entries=dict(sorted(skipped_counts.items())),
         market_delta=_summary(delta_values),
         market_delta_unpriced=unpriced,
+        vehicle_alpha=(None if alphas is None else _summary(np.array(alphas, dtype="float64"))),
+        parameters=parameters,
         coverage_ratio=None if coverage is None else round(coverage.ratio, 6),
         low_coverage_warning=None if coverage is None else coverage.low_coverage_warning,
     )
 
 
+def track_a(
+    variant: str,
+    trades: Sequence[Trade],
+    skipped: Sequence[SkippedEntry],
+    benchmark: BenchmarkPrices,
+    *,
+    coverage: data.Coverage | None = None,
+) -> TrackAStats:
+    """§6.1 for the stock track: one §4.2 zone variant's trades.
+
+    `coverage` travels with the table on purpose (acceptance 2): a headline
+    statistic and the share of the universe behind it belong to the same object,
+    so no caller can print one without the other.
+    """
+    return _summarize(
+        track=STOCK_TRACK,
+        variant=variant,
+        trades=trades,
+        returns=[trade.r_trade for trade in trades],
+        skipped=skipped,
+        benchmark=benchmark,
+        alphas=None,
+        parameters=None,
+        coverage=coverage,
+    )
+
+
+def track_a_overlay(
+    config: OverlayConfig,
+    trades: Sequence[SyntheticTrade],
+    skipped: Sequence[SkippedEntry],
+    benchmark: BenchmarkPrices,
+    *,
+    coverage: data.Coverage | None = None,
+) -> TrackAStats:
+    """§6.1 for the LEAP overlay: one §5.6 configuration's trades.
+
+    The overlay's exits differ from the stock track's, so its trade windows do
+    too — which is exactly why the vehicle alpha here is measured against each
+    overlay trade's *own* share hold rather than against the stock track's trade
+    on the same signal.
+    """
+    return _summarize(
+        track=OVERLAY_TRACK,
+        variant=config.name,
+        trades=[item.trade for item in trades],
+        returns=[item.r_overlay for item in trades],
+        skipped=skipped,
+        benchmark=benchmark,
+        alphas=[item.vehicle_alpha for item in trades],
+        parameters={
+            "zone": config.zone,
+            "sigma_multiplier": config.sigma_multiplier,
+            "friction": config.friction,
+        },
+        coverage=coverage,
+    )
+
+
 def track_a_json(stats: Sequence[TrackAStats]) -> str:
-    """Stable serialization — §10.1 wants two runs byte-identical."""
-    payload = {item.variant: item.as_dict() for item in stats}
+    """Stable serialization — §10.1 wants two runs byte-identical.
+
+    Grouped by track: "base" names a zone variant on one and a §5.6
+    configuration on the other, so a flat mapping would collide.
+    """
+    payload: dict[str, dict[str, dict]] = {}
+    for item in stats:
+        payload.setdefault(item.track, {})[item.variant] = item.as_dict()
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
