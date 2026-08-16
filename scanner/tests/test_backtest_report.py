@@ -389,6 +389,19 @@ class TestEqualWeightBenchmark:
         assert result.constituents == 1
         assert result.unpriced == 1
 
+    def test_a_shared_close_reader_gives_the_same_curve(self, tmp_path: Path) -> None:
+        """The benchmark reuses the sleeve's `ChainCloses` rather than rebuilding it."""
+        cache, calendar = self.universe(tmp_path, delist_on=None)
+        shared = data.ChainCloses(cache)
+        with_shared = metrics.equal_weight_entered(
+            ["STEADY", "STOPS"], cache, BENCH_WINDOW, calendar, closes=shared
+        )
+        own = metrics.equal_weight_entered(["STEADY", "STOPS"], cache, BENCH_WINDOW, calendar)
+
+        assert with_shared is not None and own is not None
+        assert with_shared.curve_values == own.curve_values
+        assert with_shared.constituents == own.constituents
+
     def test_no_priceable_constituent_is_none_rather_than_a_flat_line(self, tmp_path: Path) -> None:
         cache, calendar = self.universe(tmp_path, delist_on=None)
         assert metrics.equal_weight_entered(["ABSENT"], cache, BENCH_WINDOW, calendar) is None

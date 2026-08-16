@@ -696,15 +696,18 @@ def simulate_all(
     window: data.Window,
     *,
     configs: Iterable[SleeveConfig] = CONFIGS,
+    closes: data.ChainCloses | None = None,
     coverage: data.Coverage | None = None,
 ) -> tuple[SleeveResult, ...]:
     """Both P9 sleeves over the same trades, sharing labels, closes and calendar.
 
     The shared state is the point: the calendar and the close arrays are the
-    expensive parts, and neither depends on the starting equity.
+    expensive parts, and neither depends on the starting equity. `closes` is
+    accepted rather than only created so the caller can share one instance with
+    §6.3.2's benchmark, which reads the same chains.
     """
     sectors = SectorLabels.load()
-    closes = data.ChainCloses(cache)
+    closes = closes if closes is not None else data.ChainCloses(cache)
     calendar = engine.session_calendar(
         cache, window, sorted({trade.trade.chain for trade in trades})
     )

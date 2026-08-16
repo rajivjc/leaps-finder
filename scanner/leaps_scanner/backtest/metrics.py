@@ -485,6 +485,7 @@ def equal_weight_entered(
     window: data.Window,
     calendar: Sequence[date],
     *,
+    closes: data.ChainCloses | None = None,
     coverage: data.Coverage | None = None,
 ) -> BenchmarkResult | None:
     """§6.3.2: equal-weight buy-and-hold of the entered names, full window.
@@ -505,11 +506,16 @@ def equal_weight_entered(
     that pretends to have owned them from the start.
 
     P2 basis (raw `Close`), matching the stock track it is compared against.
+
+    `closes` is shared with the sleeve when the caller has one. The entered names
+    are exactly the chains §6.2 just walked, so building a second `ChainCloses`
+    re-reads all of them from Parquet for no benefit — the same reason
+    `sleeve.simulate_all` threads one instance through both of its sleeves.
     """
     if not calendar:
         return None
 
-    closes = data.ChainCloses(cache)
+    closes = closes if closes is not None else data.ChainCloses(cache)
     weights: list[np.ndarray] = []
     unpriced = 0
 

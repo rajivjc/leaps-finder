@@ -282,7 +282,11 @@ def _run_sleeve(
     base = next((item for item in overlays if item.name == "base"), overlays[0])
     trades = base.trades
 
-    sleeves = sleeve.simulate_all(trades, cache, window, coverage=coverage)
+    # One set of close arrays for both sleeves *and* §6.3.2's benchmark: they all
+    # read the same entered chains, and loading ~570 Parquet frames twice is the
+    # most expensive thing this function could do by accident.
+    closes = data.ChainCloses(cache)
+    sleeves = sleeve.simulate_all(trades, cache, window, closes=closes, coverage=coverage)
     unlabelled = _traded_without_sector(trades)
 
     calendar = engine.session_calendar(
@@ -293,7 +297,9 @@ def _run_sleeve(
         item
         for item in (
             metrics.spy_buy_and_hold(cache, window, coverage=coverage),
-            metrics.equal_weight_entered(entered, cache, window, calendar, coverage=coverage),
+            metrics.equal_weight_entered(
+                entered, cache, window, calendar, closes=closes, coverage=coverage
+            ),
         )
         if item is not None
     )
