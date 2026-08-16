@@ -21,7 +21,7 @@ Personal project for RC. Public portfolio repo. Not financial advice; the app mu
 | Universe | US-listed common stocks, market cap ≥ $50B, optionable (~250 names) |
 | Auth | Supabase Auth (magic link). Single allow-listed email (owner) can write positions; scan results publicly readable |
 | Scope v1 | Screener + LEAP economics + score + positions/exit monitor + size calculator |
-| Deferred | Backtesting (v1.5), email alerts, multi-user |
+| Deferred | Backtesting — now v2, spec'd in SPEC-BACKTEST.md (§12); email alerts; multi-user |
 
 ---
 
@@ -273,7 +273,8 @@ open premium / equity vs the 15% cap, per-sector counts vs the 2-per-sector cap,
 | Earnings heads-up | earnings within 21d (informational) | daily |
 | Circuit breaker | realized+unrealized sleeve loss ≥ 8% of entry equity → banner "no new entries 4 weeks" | daily |
 
-Alerts are rows in `alerts`, surfaced as a banner + list in the UI. (Email via Resend = v1.5.)
+Alerts are rows in `alerts`, surfaced as a banner + list in the UI. (Email via Resend:
+still parked — see §12.)
 
 ---
 
@@ -348,12 +349,11 @@ no score-inflating visual tricks (no green-at-70 thresholds; neutral color below
 6. **M6 Polish:** README with architecture diagram + screenshots, Vercel deploy, disclaimers,
    Actions badges.
 
-## 12. v1.5 (parked)
+## 12. Post-v1 scope
 
-Backtest of the stock-level signal (entry: 5 filters minus IV; exit: §7 rules) over 10y of
-daily data, with approximate LEAP P&L via BS repricing under flat-IV assumption; report CAGR,
-max DD, win rate, vs buy-and-hold. Email alerts via Resend. IV-rank graduation once 252
-snapshots accumulate.
+Backtesting is specified as **v2** in [SPEC-BACKTEST.md](SPEC-BACKTEST.md) (its own
+source-of-truth document; decisions locked 2026-08-16). Still parked: email alerts via
+Resend; IV-rank graduation once 252 snapshots accumulate.
 
 ---
 

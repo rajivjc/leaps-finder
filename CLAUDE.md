@@ -7,7 +7,8 @@ A LEAPS options screener: Next.js (Vercel) + Supabase + Python scanner (GitHub A
 **SPEC.md is the source of truth.** All formulas (stochastic, Black-Scholes delta, scoring,
 presets, exit rules) are pinned there exactly — implement them as written, do not improvise
 the math. If something in the spec seems wrong or ambiguous, stop and ask; don't silently
-deviate.
+deviate. **SPEC-BACKTEST.md carries the same authority for v2 (backtesting)**; if the two
+documents ever conflict, that too is a stop-and-ask, not a judgment call.
 
 ## Workflow
 
