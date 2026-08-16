@@ -991,6 +991,29 @@ class TestDeterminism:
         assert once() == once()
 
 
+# The §5 overlay is the first thing in the backtest to call exp, log and erf,
+# and those are not bit-identical across platforms: numpy's vectorized `np.log`
+# on x86-64 and the scalar libm on arm64 disagree in the last ULP, which
+# propagates through RV252 into every premium. Decisions do not move — the dates,
+# exit reasons and skip lists below are compared exactly, and a flipped premium
+# stop would show up there — so only the *values* are rounded, nine decimals
+# deep, six orders of magnitude clear of the noise and far finer than the "to the
+# cent" §9 asks of them. Acceptance 1's determinism is unaffected: it is about
+# two runs from one cache on one machine, which stay byte-identical.
+GOLDEN_PRECISION = 9
+
+
+def _portable(value):
+    """`value` with every float rounded to `GOLDEN_PRECISION` decimals."""
+    if isinstance(value, dict):
+        return {key: _portable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_portable(item) for item in value]
+    if isinstance(value, float):
+        return round(value, GOLDEN_PRECISION)
+    return value
+
+
 def golden_payload(membership: Membership, cache: data.PriceCache) -> dict:
     """The committed integration fixture (§9): trades plus §6.1's tables.
 
@@ -1015,9 +1038,9 @@ def golden_payload(membership: Membership, cache: data.PriceCache) -> dict:
         "skipped": {
             name: [entry.as_dict() for entry in rows] for name, rows in result.skipped.items()
         },
-        "overlay_trades": {
-            overlay.name: [trade.as_dict() for trade in overlay.trades] for overlay in overlays
-        },
+        "overlay_trades": _portable(
+            {overlay.name: [trade.as_dict() for trade in overlay.trades] for overlay in overlays}
+        ),
         "overlay_skipped": {
             overlay.name: [entry.as_dict() for entry in overlay.skipped] for overlay in overlays
         },
@@ -1027,12 +1050,14 @@ def golden_payload(membership: Membership, cache: data.PriceCache) -> dict:
             ).as_dict()
             for name in result.trades
         },
-        "track_a_overlay": {
-            overlay.name: metrics.track_a_overlay(
-                overlay.config, overlay.trades, overlay.skipped, benchmark
-            ).as_dict()
-            for overlay in overlays
-        },
+        "track_a_overlay": _portable(
+            {
+                overlay.name: metrics.track_a_overlay(
+                    overlay.config, overlay.trades, overlay.skipped, benchmark
+                ).as_dict()
+                for overlay in overlays
+            }
+        ),
     }
 
 
