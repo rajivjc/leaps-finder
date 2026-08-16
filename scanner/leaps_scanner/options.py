@@ -198,17 +198,130 @@ def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
+# Acklam's rational approximation to the inverse normal CDF, in its usual
+# published arrangement: a central branch either side of the median and a
+# log-transformed tail branch beyond `_ACKLAM_BREAK`.
+_ACKLAM_A = (
+    -3.969683028665376e01,
+    2.209460984245205e02,
+    -2.759285104469687e02,
+    1.383577518672690e02,
+    -3.066479806614716e01,
+    2.506628277459239e00,
+)
+_ACKLAM_B = (
+    -5.447609879822406e01,
+    1.615858368580409e02,
+    -1.556989798598866e02,
+    6.680131188771972e01,
+    -1.328068155288572e01,
+)
+_ACKLAM_C = (
+    -7.784894002430293e-03,
+    -3.223964580411365e-01,
+    -2.400758277161838e00,
+    -2.549732539343734e00,
+    4.374664141464968e00,
+    2.938163982698783e00,
+)
+_ACKLAM_D = (
+    7.784695709041462e-03,
+    3.224671290700398e-01,
+    2.445134137142996e00,
+    3.754408661907416e00,
+)
+_ACKLAM_BREAK = 0.02425
+
+
+def _acklam(p: float) -> float:
+    """The rational approximation alone, before refinement (~1e-9 relative)."""
+    if p < _ACKLAM_BREAK:
+        t = math.sqrt(-2.0 * math.log(p))
+        numerator = (
+            (((_ACKLAM_C[0] * t + _ACKLAM_C[1]) * t + _ACKLAM_C[2]) * t + _ACKLAM_C[3]) * t
+            + _ACKLAM_C[4]
+        ) * t + _ACKLAM_C[5]
+        denominator = ((_ACKLAM_D[0] * t + _ACKLAM_D[1]) * t + _ACKLAM_D[2]) * t + _ACKLAM_D[3]
+        return numerator / (denominator * t + 1.0)
+    if p > 1.0 - _ACKLAM_BREAK:
+        return -_acklam(1.0 - p)
+
+    q = p - 0.5
+    r = q * q
+    numerator = (
+        (((_ACKLAM_A[0] * r + _ACKLAM_A[1]) * r + _ACKLAM_A[2]) * r + _ACKLAM_A[3]) * r
+        + _ACKLAM_A[4]
+    ) * r + _ACKLAM_A[5]
+    denominator = (
+        ((_ACKLAM_B[0] * r + _ACKLAM_B[1]) * r + _ACKLAM_B[2]) * r + _ACKLAM_B[3]
+    ) * r + _ACKLAM_B[4]
+    return numerator * q / (denominator * r + 1.0)
+
+
+def inv_norm_cdf(p: float) -> float:
+    """The inverse of `norm_cdf` — SPEC-BACKTEST.md §5.2's `N⁻¹`.
+
+    Sits here rather than in the backtest package because §5.2 extends SPEC.md
+    §5's pricing math, and that math has exactly one home. Still no scipy: a
+    rational approximation gets to about 1e-9 *relative* error, which is not
+    reliably inside §9's `norm_cdf(inv_norm_cdf(p)) = p ± 1e−9` round trip, so
+    one Halley step against `norm_cdf` itself refines it to machine precision.
+    That also makes the two functions inverses of *each other* by construction
+    rather than by two independent approximations happening to agree.
+    """
+    if not 0.0 < p < 1.0:
+        raise ValueError("p must lie strictly between 0 and 1")
+
+    x = _acklam(p)
+    error = norm_cdf(x) - p
+    try:
+        # e · √(2π) · e^(x²/2) is the Newton step (the density is the
+        # derivative); the trailing division is Halley's second-order term.
+        step = error * math.sqrt(2.0 * math.pi) * math.exp(x * x / 2.0)
+    except OverflowError:
+        # Twenty-odd sigma out, where the density underflows and the
+        # approximation is already the best a float64 can carry.
+        return x
+    return x - step / (1.0 + x * step / 2.0)
+
+
+def _bs_d1(spot: float, strike: float, t_years: float, r: float, q: float, sigma: float) -> float:
+    """SPEC.md §5.2's d1, the one place it is written down."""
+    if spot <= 0 or strike <= 0 or t_years <= 0 or sigma <= 0:
+        raise ValueError("spot, strike, T and sigma must all be positive")
+    return (math.log(spot / strike) + (r - q + sigma**2 / 2.0) * t_years) / (
+        sigma * math.sqrt(t_years)
+    )
+
+
 def bs_delta(spot: float, strike: float, t_years: float, r: float, q: float, sigma: float) -> float:
     """Black-Scholes call delta, exactly as pinned in SPEC.md §5.2.
 
     d1 = (ln(S/K) + (r − q + σ²/2)T) / (σ√T),  delta = e^(−qT) · N(d1)
     """
-    if spot <= 0 or strike <= 0 or t_years <= 0 or sigma <= 0:
-        raise ValueError("spot, strike, T and sigma must all be positive")
-    d1 = (math.log(spot / strike) + (r - q + sigma**2 / 2.0) * t_years) / (
-        sigma * math.sqrt(t_years)
-    )
+    d1 = _bs_d1(spot, strike, t_years, r, q, sigma)
     return math.exp(-q * t_years) * norm_cdf(d1)
+
+
+def bs_call_price(
+    spot: float, strike: float, t_years: float, r: float, q: float, sigma: float
+) -> float:
+    """Black-Scholes call price, SPEC-BACKTEST.md §5's pinned form.
+
+    d2 = d1 − σ√T,  C = S·e^(−qT)·N(d1) − K·e^(−rT)·N(d2)
+
+    SPEC.md pins no option price — v1 reads a mid off the chain — so §5 of the
+    backtest spec is the authority, and it says to add the price here beside the
+    delta it shares a d1 with. Same argument order and the same strictness about
+    non-positive inputs as `bs_delta`: an expired or zero-vol contract has an
+    intrinsic value, not a Black-Scholes one, and the caller that needs that
+    limit should say so rather than have it guessed at here.
+    """
+    d1 = _bs_d1(spot, strike, t_years, r, q, sigma)
+    d2 = d1 - sigma * math.sqrt(t_years)
+    return spot * math.exp(-q * t_years) * norm_cdf(d1) - strike * math.exp(
+        -r * t_years
+    ) * norm_cdf(d2)
 
 
 def select_leap_expiry(expiries: Sequence[date], today: date) -> ExpiryChoice | None:
@@ -455,11 +568,17 @@ def interpolate_iv30(terms: Sequence[tuple[int, float]]) -> float | None:
     return nearest[1]
 
 
-def realized_vol_20d(close: pd.Series) -> float | None:
+def realized_vol_20d(close: pd.Series, window: int = RV_WINDOW) -> float | None:
     """20-day realized volatility, annualized (§3.5): sample std of the last
-    20 daily log returns × √252."""
-    returns = np.log(close / close.shift(1)).dropna().tail(RV_WINDOW)
-    if len(returns) < RV_WINDOW:
+    20 daily log returns × √252.
+
+    `window` exists for SPEC-BACKTEST.md §5.1's RV252, which is *this*
+    computation at a 252-session window and which that spec explicitly wants
+    parameterized here rather than reimplemented next door. The default keeps
+    v1's §3.5 reading unchanged, so every existing call site means what it did.
+    """
+    returns = np.log(close / close.shift(1)).dropna().tail(window)
+    if len(returns) < window:
         return None
     return float(returns.std(ddof=1) * math.sqrt(TRADING_DAYS_PER_YEAR))
 

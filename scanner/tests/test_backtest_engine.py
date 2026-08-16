@@ -21,7 +21,7 @@ import pytest
 
 from leaps_scanner import indicators
 from leaps_scanner.backtest import __main__ as backtest_main
-from leaps_scanner.backtest import data, engine, metrics
+from leaps_scanner.backtest import data, engine, metrics, synthetic
 from leaps_scanner.backtest.membership import Membership
 
 GOLDEN_DIR = Path(__file__).parent / "golden"
@@ -152,20 +152,52 @@ def fixture_membership(tmp_path: Path) -> Membership:
     return Membership.load(path)
 
 
+def rate_frame(days: list[date], *, base: float = 1.6, amplitude: float = 0.4) -> pd.DataFrame:
+    """A stand-in ^IRX series. `Close` quotes the rate ×100, as Yahoo does."""
+    index = np.arange(len(days), dtype="float64")
+    close = base + amplitude * np.sin(index / 180.0 * 2 * math.pi)
+    return pd.DataFrame(
+        {
+            "Open": close,
+            "High": close,
+            "Low": close,
+            "Close": close,
+            "Adj Close": close,
+            "Volume": np.zeros(len(days)),
+        },
+        index=pd.DatetimeIndex([pd.Timestamp(day) for day in days]),
+    )
+
+
+def with_dividends(frame: pd.DataFrame, *, amount: float, every: int) -> pd.DataFrame:
+    """Attach a regular cash dividend, in the `actions=True` column layout."""
+    frame = frame.copy()
+    payments = np.zeros(len(frame))
+    payments[every::every] = amount
+    frame[data.DIVIDEND_COLUMN] = payments
+    return frame
+
+
 def fixture_frames() -> dict[str, pd.DataFrame]:
     """The fixture universe's cached series, keyed by the ticker they live under.
 
     `OLD` has no file of its own: §2.3a's whole point is that Yahoo serves a
     renamed company only under its current ticker, so `NEW` carries the history
     for both spans and §4.3a runs a position straight through the boundary.
+
+    `^IRX` and the dividend column are §5.1's r and q. They are here rather than
+    in the overlay's own tests so the integration golden covers a universe with
+    a payer (`AAA`), a non-payer (`BBB`) and a renamed chain (`NEW`) in it.
     """
     days = business_days(FIXTURE_START, FIXTURE_END)
     short = [day for day in days if day <= date(2019, 3, 13)]
     return {
-        "AAA": price_frame(days, phase=0.0),
+        "AAA": with_dividends(price_frame(days, phase=0.0), amount=0.42, every=63),
         # Delists mid-window, three sessions before its membership row closes.
         "BBB": price_frame(short, base=54.0, phase=1.9, fast_period=48.0),
-        "NEW": price_frame(days, base=210.0, phase=3.6, fast_period=62.0),
+        "NEW": with_dividends(
+            price_frame(days, base=210.0, phase=3.6, fast_period=62.0), amount=1.10, every=63
+        ),
         data.BENCHMARK_SYMBOL: price_frame(
             days,
             base=180.0,
@@ -174,6 +206,7 @@ def fixture_frames() -> dict[str, pd.DataFrame]:
             slow_period=300.0,
             fast_amplitude=0.02,
         ),
+        data.RATE_SYMBOL: rate_frame(days),
     }
 
 
@@ -958,9 +991,38 @@ class TestDeterminism:
         assert once() == once()
 
 
+# The §5 overlay is the first thing in the backtest to call exp, log and erf,
+# and those are not bit-identical across platforms: numpy's vectorized `np.log`
+# on x86-64 and the scalar libm on arm64 disagree in the last ULP, which
+# propagates through RV252 into every premium. Decisions do not move — the dates,
+# exit reasons and skip lists below are compared exactly, and a flipped premium
+# stop would show up there — so only the *values* are rounded, nine decimals
+# deep, six orders of magnitude clear of the noise and far finer than the "to the
+# cent" §9 asks of them. Acceptance 1's determinism is unaffected: it is about
+# two runs from one cache on one machine, which stay byte-identical.
+GOLDEN_PRECISION = 9
+
+
+def _portable(value):
+    """`value` with every float rounded to `GOLDEN_PRECISION` decimals."""
+    if isinstance(value, dict):
+        return {key: _portable(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_portable(item) for item in value]
+    if isinstance(value, float):
+        return round(value, GOLDEN_PRECISION)
+    return value
+
+
 def golden_payload(membership: Membership, cache: data.PriceCache) -> dict:
-    """The committed integration fixture (§9): trades plus §6.1's tables."""
-    result = engine.run(membership, cache, FIXTURE_WINDOW)
+    """The committed integration fixture (§9): trades plus §6.1's tables.
+
+    Both tracks, and every §5.6 configuration — the overlay's trade set diverges
+    from the stock track's wherever a premium stop fires, so pinning only the
+    stock track would leave that divergence unwitnessed.
+    """
+    overlays = synthetic.build_overlays(cache)
+    result = engine.run(membership, cache, FIXTURE_WINDOW, overlays=overlays)
     benchmark = metrics.BenchmarkPrices(cache.load_benchmark())
     return {
         "window": {
@@ -976,12 +1038,26 @@ def golden_payload(membership: Membership, cache: data.PriceCache) -> dict:
         "skipped": {
             name: [entry.as_dict() for entry in rows] for name, rows in result.skipped.items()
         },
+        "overlay_trades": _portable(
+            {overlay.name: [trade.as_dict() for trade in overlay.trades] for overlay in overlays}
+        ),
+        "overlay_skipped": {
+            overlay.name: [entry.as_dict() for entry in overlay.skipped] for overlay in overlays
+        },
         "track_a": {
             name: metrics.track_a(
                 name, result.trades[name], result.skipped[name], benchmark
             ).as_dict()
             for name in result.trades
         },
+        "track_a_overlay": _portable(
+            {
+                overlay.name: metrics.track_a_overlay(
+                    overlay.config, overlay.trades, overlay.skipped, benchmark
+                ).as_dict()
+                for overlay in overlays
+            }
+        ),
     }
 
 

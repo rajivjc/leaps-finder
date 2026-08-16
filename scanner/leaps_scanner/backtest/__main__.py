@@ -1,11 +1,11 @@
 """`python -m leaps_scanner.backtest` — manual, local, never a scheduled job.
 
-Through B2: resolve the window, build the point-in-time universe, fill the price
+Through B3: resolve the window, build the point-in-time universe, fill the price
 cache, report §2.4 coverage, then replay §4 over the universe and print §6.1's
-Track A tables for the stock track. The option overlay and the sleeve arrive in
-B3-B4, and so does the committed report — §8 puts results under
-`docs/backtest/<run-date>/`, which is B4's deliverable, so this command writes
-nothing unless asked to.
+Track A tables for the stock track and for every §5.6 configuration of the LEAP
+overlay. The sleeve arrives in B4, and so does the committed report — §8 puts
+results under `docs/backtest/<run-date>/`, which is B4's deliverable, so this
+command writes nothing unless asked to.
 
 §2.4's floor gates the engine, not just the report: below 80% coverage the run
 is `failed` and computes no statistics, because a headline number over a
@@ -19,10 +19,11 @@ import argparse
 import json
 import logging
 import sys
+from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from leaps_scanner.backtest import data, engine, metrics
+from leaps_scanner.backtest import data, engine, metrics, synthetic
 from leaps_scanner.backtest.membership import Membership
 
 logger = logging.getLogger("leaps_scanner.backtest")
@@ -74,6 +75,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="write every simulated trade as JSON to this path",
+    )
+    parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="stock track only; skip §5's synthetic LEAP overlay and its sensitivity grid",
     )
     return parser
 
@@ -155,13 +161,18 @@ def _run_engine(
     coverage: data.Coverage,
     args: argparse.Namespace,
 ) -> None:
-    """§4's replay and §6.1's Track A tables, for the stock track.
+    """§4's replay and §6.1's Track A tables, for both tracks.
 
     `coverage` is passed into the statistics rather than merely logged above:
     acceptance 2 wants the low-coverage warning on every headline table, and
     these are headline tables.
+
+    The overlays are replayed inside the same pass over the universe: §5.6 makes
+    sharing the signals and the stock track normative, and the engine already
+    holds each chain's panel while it walks it.
     """
-    result = engine.run(membership, cache, window)
+    overlays = () if args.no_overlay else synthetic.build_overlays(cache)
+    result = engine.run(membership, cache, window, overlays=overlays)
     logger.info(
         "engine: %d rename chains, %d priced; %s",
         result.chains,
@@ -176,17 +187,25 @@ def _run_engine(
         )
         for name in result.trades
     ]
+    stats.extend(
+        metrics.track_a_overlay(
+            overlay.config, overlay.trades, overlay.skipped, benchmark, coverage=coverage
+        )
+        for overlay in overlays
+    )
 
     if args.track_a_json:
         args.track_a_json.write_text(metrics.track_a_json(stats), encoding="utf-8")
     if args.trades_json:
-        args.trades_json.write_text(_trades_json(result), encoding="utf-8")
+        args.trades_json.write_text(_trades_json(result, overlays), encoding="utf-8")
 
     for item in stats:
         print(_track_a_line(item), file=sys.stderr)
 
 
-def _trades_json(result: engine.EngineResult) -> str:
+def _trades_json(
+    result: engine.EngineResult, overlays: Sequence[synthetic.LeapOverlay] = ()
+) -> str:
     payload = {
         "trades": {
             name: [trade.as_dict() for trade in rows] for name, rows in result.trades.items()
@@ -194,19 +213,31 @@ def _trades_json(result: engine.EngineResult) -> str:
         "skipped": {
             name: [entry.as_dict() for entry in rows] for name, rows in result.skipped.items()
         },
+        "overlay_trades": {
+            overlay.name: [trade.as_dict() for trade in overlay.trades] for overlay in overlays
+        },
+        "overlay_skipped": {
+            overlay.name: [entry.as_dict() for entry in overlay.skipped] for overlay in overlays
+        },
     }
     return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
 def _track_a_line(stats: metrics.TrackAStats) -> str:
-    """One line per variant. P13: Strict is reported alongside, not as headline."""
-    label = "" if stats.variant == "base" else f" [{stats.variant} zone variant, not headline]"
+    """One line per table. P13: Strict is reported alongside, not as headline."""
+    label = "" if stats.variant == "base" else f" [{stats.variant}, not headline]"
+    if stats.parameters is not None:
+        label = (
+            f" [m={stats.parameters['sigma_multiplier']}, h={stats.parameters['friction']}, "
+            f"{stats.parameters['zone']} zone"
+            f"{'' if stats.variant == 'base' else ', not headline'}]"
+        )
     if stats.low_coverage_warning:
         # Acceptance 2: below 85% the warning rides on the table itself, ahead of
         # the numbers, where it cannot be read separately from them.
         label += f" [LOW COVERAGE {100 * (stats.coverage_ratio or 0):.1f}%]"
     if not stats.trades:
-        return f"track A {stats.variant}: no trades{label}"
+        return f"track A {stats.track} {stats.variant}: no trades{label}"
 
     # A missing benchmark is reported as missing. Printing `+0.00%` for "not
     # computed" would state a measured match with the market that never happened
@@ -217,12 +248,17 @@ def _track_a_line(stats: metrics.TrackAStats) -> str:
         if market_delta is not None
         else f"n/a ({stats.market_delta_unpriced} trades unpriced)"
     )
+    # §6.1 reports vehicle alpha on the overlay only; on the stock track it is
+    # not a zero to print, it is a quantity that does not exist.
+    alpha = None if stats.vehicle_alpha is None else stats.vehicle_alpha["mean"]
+    alpha_text = "" if alpha is None else f", vehicle alpha {100 * alpha:+.2f}%"
     return (
-        f"track A {stats.variant}: {stats.trades} trades over {stats.chains} names, "
+        f"track A {stats.track} {stats.variant}: "
+        f"{stats.trades} trades over {stats.chains} names, "
         f"win rate {100 * stats.win_rate:.1f}%, "
         f"mean {100 * stats.mean_return:+.2f}%, "
         f"median {100 * stats.median_return:+.2f}%, "
-        f"market delta {delta_text}{label}"
+        f"market delta {delta_text}{alpha_text}{label}"
     )
 
 
