@@ -1,10 +1,16 @@
-"""Track A statistics (SPEC-BACKTEST.md §6.1), for both of its tracks.
+"""Track A statistics (SPEC-BACKTEST.md §6.1) and §6.3's benchmarks.
 
 Per-trade, not per-portfolio: every §4.2 signal counted independently, which is
 the primary result §6 asks for. The sleeve's portfolio arithmetic is §6.2 and
-belongs to B4, and §6.3's buy-and-hold benchmarks are reported beside it there.
-What lands here is what §6.1 pins — the distribution of trade outcomes, and the
-per-trade benchmarks each track can carry.
+lives in `sleeve.py`. What lands here is what §6.1 pins — the distribution of
+trade outcomes, and the per-trade benchmarks each track can carry — plus §6.3's
+two buy-and-hold curves, which are portfolio-level but belong beside the
+statistics they are compared against rather than inside the simulation.
+
+`max_drawdown` and `cagr` are shared with the sleeve deliberately: §6.2 and
+§6.3 both measure drawdown on a daily curve and growth over the same window, and
+two implementations of one definition is how the sleeve and its own benchmark
+end up not comparable.
 
 §6.1 lists one table and reports it "for both the stock track and the LEAP
 overlay", so there is one summarizer here and the track is a field on the
@@ -27,6 +33,7 @@ import numpy as np
 import pandas as pd
 
 from leaps_scanner.backtest import data
+from leaps_scanner.backtest.data import ADJ_CLOSE
 from leaps_scanner.backtest.engine import SkippedEntry, Trade
 from leaps_scanner.backtest.synthetic import OverlayConfig, SyntheticTrade
 
@@ -299,6 +306,258 @@ def track_a_overlay(
             "friction": config.friction,
         },
         coverage=coverage,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Curve arithmetic, shared by §6.2's sleeve and §6.3's benchmarks.
+# ---------------------------------------------------------------------------
+
+
+def max_drawdown(dates: Sequence[date], curve: Sequence[float]) -> tuple[float | None, date | None]:
+    """Deepest peak-to-trough fall on a daily curve, as a positive fraction.
+
+    Returns the trough date alongside, so a report can say *when* rather than
+    only how deep. `None` when there is no curve to measure — an empty run has
+    no drawdown, which is a different claim from a drawdown of zero.
+    """
+    if not curve:
+        return None, None
+    peak = curve[0]
+    worst = 0.0
+    worst_date = dates[0]
+    for day, value in zip(dates, curve, strict=True):
+        if value > peak:
+            peak = value
+        if peak > 0:
+            drop = 1.0 - value / peak
+            if drop > worst:
+                worst, worst_date = drop, day
+    return worst, worst_date
+
+
+def cagr(start: float, final: float, window: data.Window) -> float | None:
+    """Compound annual growth from `start` to `final` over the whole window.
+
+    `None` when it is not defined rather than a stand-in number: a curve that
+    ended at or below zero has no real growth rate (the root of a non-positive
+    ratio is not a real number), and reporting one would be inventing a figure at
+    the exact moment the truth is worst.
+    """
+    years = (window.end - window.start).days / 365.25
+    if years <= 0 or start <= 0 or final <= 0:
+        return None
+    return (final / start) ** (1.0 / years) - 1.0
+
+
+# ---------------------------------------------------------------------------
+# §6.3's benchmarks.
+# ---------------------------------------------------------------------------
+
+# §6.3.1's caption, normative rather than editorial: the sleeve risks at most 15%
+# of equity by design while SPY is fully invested, so the two CAGRs are not
+# like-for-like and the table must say so where the numbers are, not in a
+# footnote a reader can skip.
+EXPOSURE_CAVEAT = (
+    "Not like-for-like: the sleeve holds at most 15% of equity in premium by "
+    "design (SPEC.md §7) and the rest in cash at 0%, while SPY is 100% invested "
+    "throughout. Compare the shapes, not the headline CAGRs."
+)
+
+
+@dataclass(frozen=True)
+class BenchmarkResult:
+    """One §6.3 buy-and-hold curve, normalized to 1.0 at the window start."""
+
+    name: str
+    label: str
+    # A legend-length name. The full label describes the construction and does
+    # not fit a chart key; truncating it there would clip mid-word, so the short
+    # form is chosen rather than derived.
+    short_label: str
+    total_return: float | None
+    cagr: float | None
+    max_drawdown: float | None
+    max_drawdown_date: date | None
+    curve_dates: tuple[date, ...]
+    curve_values: tuple[float, ...]
+    # §6.3.2 only: how many names the curve actually holds, and how many entered
+    # names had no usable price. An equal-weight benchmark that quietly dropped a
+    # third of its constituents is not the benchmark §6.3.2 describes.
+    constituents: int | None = None
+    unpriced: int | None = None
+    caveat: str | None = None
+    coverage_ratio: float | None = None
+    low_coverage_warning: bool | None = None
+
+    def as_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "label": self.label,
+            "short_label": self.short_label,
+            "total_return": self.total_return,
+            "cagr": self.cagr,
+            "max_drawdown": self.max_drawdown,
+            "max_drawdown_date": (
+                self.max_drawdown_date.isoformat() if self.max_drawdown_date else None
+            ),
+            "constituents": self.constituents,
+            "unpriced": self.unpriced,
+            "caveat": self.caveat,
+            "coverage_ratio": self.coverage_ratio,
+            "low_coverage_warning": self.low_coverage_warning,
+        }
+
+
+def _curve_result(
+    name: str,
+    label: str,
+    short_label: str,
+    dates: Sequence[date],
+    values: Sequence[float],
+    window: data.Window,
+    **extra: object,
+) -> BenchmarkResult:
+    """Wrap a normalized curve in §6.3's reported statistics."""
+    drawdown, drawdown_date = max_drawdown(dates, values)
+    final = values[-1] if values else None
+    return BenchmarkResult(
+        name=name,
+        label=label,
+        short_label=short_label,
+        total_return=(final - 1.0) if final is not None else None,
+        cagr=cagr(1.0, final, window) if final is not None else None,
+        max_drawdown=drawdown,
+        max_drawdown_date=drawdown_date,
+        curve_dates=tuple(dates),
+        curve_values=tuple(values),
+        **extra,  # type: ignore[arg-type]
+    )
+
+
+def spy_buy_and_hold(
+    cache: data.PriceCache,
+    window: data.Window,
+    *,
+    coverage: data.Coverage | None = None,
+) -> BenchmarkResult | None:
+    """§6.3.1: SPY total return over the full window.
+
+    `Adj Close`, not `Close` — §6.3.1 says total return in so many words, and P2
+    retains the column for exactly this. Using the raw close here would silently
+    strip a decade of dividends out of the benchmark the strategy is judged
+    against, which is the one direction that would flatter the result.
+
+    `None` when SPY is not cached: §3.5 lets a run continue without it, and a
+    missing benchmark is reported as missing rather than rendered as a flat line.
+    """
+    frame = cache.load_benchmark()
+    if frame is None or frame.empty or ADJ_CLOSE not in frame:
+        return None
+
+    frame = frame.sort_index()
+    stamps = pd.DatetimeIndex(frame.index)
+    inside = (stamps.date >= window.start) & (stamps.date <= window.end)
+    values = frame[ADJ_CLOSE].to_numpy(dtype="float64")[inside]
+    days = [stamp.date() for stamp in stamps[inside]]
+
+    usable = np.isfinite(values) & (values > 0)
+    values, days = values[usable], [day for day, keep in zip(days, usable, strict=True) if keep]
+    if values.size == 0:
+        return None
+
+    return _curve_result(
+        "spy_total_return",
+        f"{data.BENCHMARK_SYMBOL} buy-and-hold (total return)",
+        f"{data.BENCHMARK_SYMBOL} (total return)",
+        days,
+        (values / values[0]).tolist(),
+        window,
+        caveat=EXPOSURE_CAVEAT,
+        coverage_ratio=None if coverage is None else round(coverage.ratio, 6),
+        low_coverage_warning=None if coverage is None else coverage.low_coverage_warning,
+    )
+
+
+def equal_weight_entered(
+    chains: Sequence[str],
+    cache: data.PriceCache,
+    window: data.Window,
+    calendar: Sequence[date],
+    *,
+    closes: data.ChainCloses | None = None,
+    coverage: data.Coverage | None = None,
+) -> BenchmarkResult | None:
+    """§6.3.2: equal-weight buy-and-hold of the entered names, full window.
+
+    **Full window, not each trade's window** — the amendment §0's Decision 7
+    records. A same-trade-window hold is arithmetically the stock track itself
+    (`r_trade` *is* that hold), so the original wording compared the strategy
+    against a restatement of itself. Over the full window it answers the question
+    it was meant to: does the *timing* add anything beyond the names?
+
+    Each name is bought at its first eligible session (§3.1's warm-up rule, so a
+    name is held only from the date the strategy could have evaluated it) and
+    held to the window end. A name that delists mid-window holds to its last
+    close and then sits in cash — its wealth relative simply stops moving, which
+    is what `close_on`'s last-price-at-or-before lookup does by construction.
+    Before its own start a name contributes 1.0, i.e. uninvested cash, so the
+    curve is a portfolio that fills up as names become eligible rather than one
+    that pretends to have owned them from the start.
+
+    P2 basis (raw `Close`), matching the stock track it is compared against.
+
+    `closes` is shared with the sleeve when the caller has one. The entered names
+    are exactly the chains §6.2 just walked, so building a second `ChainCloses`
+    re-reads all of them from Parquet for no benefit — the same reason
+    `sleeve.simulate_all` threads one instance through both of its sleeves.
+    """
+    if not calendar:
+        return None
+
+    closes = closes if closes is not None else data.ChainCloses(cache)
+    weights: list[np.ndarray] = []
+    unpriced = 0
+
+    for chain in sorted(set(chains)):
+        frame = cache.load(chain)
+        eligible = data.first_eligible_date(frame)
+        if eligible is None:
+            unpriced += 1
+            continue
+        start_day = max(eligible, window.start)
+
+        basis: float | None = None
+        relative = np.ones(len(calendar), dtype="float64")
+        for position, day in enumerate(calendar):
+            if day < start_day:
+                continue
+            price = closes.close_on(chain, day)
+            if price is None:
+                continue
+            if basis is None:
+                basis = price
+            relative[position] = price / basis
+        if basis is None:
+            unpriced += 1
+            continue
+        weights.append(relative)
+
+    if not weights:
+        return None
+
+    curve = np.mean(np.vstack(weights), axis=0)
+    return _curve_result(
+        "equal_weight_entered",
+        "Equal-weight buy-and-hold of entered names (full window)",
+        "Equal-weight entered names",
+        list(calendar),
+        curve.tolist(),
+        window,
+        constituents=len(weights),
+        unpriced=unpriced,
+        coverage_ratio=None if coverage is None else round(coverage.ratio, 6),
+        low_coverage_warning=None if coverage is None else coverage.low_coverage_warning,
     )
 
 

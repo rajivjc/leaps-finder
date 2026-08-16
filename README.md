@@ -89,8 +89,9 @@ which is the whole reason the secret key never leaves Actions.
 | `scanner/` | Python package `leaps_scanner` — the whole pipeline |
 | `supabase/migrations/` | Schema and RLS policies |
 | `.github/workflows/` | CI, plus the weekly and daily scan crons |
-| `docs/` | Supabase setup runbook, and the screenshots above |
+| `docs/` | Supabase setup runbook, the screenshots above, and committed backtest runs |
 | `SPEC.md` | Source of truth for every formula, threshold, and preset |
+| `SPEC-BACKTEST.md` | Source of truth for v2, the backtest — same authority as SPEC.md |
 
 ## Getting started
 
@@ -226,6 +227,40 @@ A symbol without enough history to define every signal is excluded rather than a
 and a 10-week window with no range yields no stochastic rather than an invented midpoint. If
 more than 20% of the universe ends up missing for any reason, the scan is recorded as `failed`
 and the screener will not display it. Partial data never looks complete.
+
+## Backtest
+
+Ten years of the entry/exit **timing** signal, replayed over point-in-time S&P 500 membership.
+It is a separate piece of work with its own source of truth, [SPEC-BACKTEST.md](SPEC-BACKTEST.md),
+and it deliberately does **not** evaluate the whole strategy: the quality, valuation, IV-rank
+and earnings-distance filters need point-in-time fundamentals that cannot be reconstructed
+without look-ahead bias, and the preset liquidity gates need historical option chains nobody
+has. A good result here validates two of the five filters, and the report says so in a banner
+above every number.
+
+Runs are manual and local — an analysis, not a pipeline, so there is no cron and no Actions
+job. Each one is committed under `docs/backtest/<run-date>/` as a human report, a
+machine-readable `results.json`, and equity-curve SVGs; the `/backtest` page renders the most
+recent one at build time. The build fails outright if `results.json` has no banner, so the
+page cannot show a metric without the caveat that says what it means.
+
+```bash
+make backtest        # or: python -m leaps_scanner.backtest --report-dir docs/backtest
+```
+
+The first fetch is network-bound and takes roughly 30–45 minutes at the throttle the live
+scanner uses; from a warm cache a full run — six sensitivity configurations, both sleeves and
+both benchmarks — takes about 16 seconds and is byte-for-byte reproducible. The price cache is
+git-ignored: no raw Yahoo data is ever committed.
+
+**What the first run found**, and it is not flattering: the stock signal is mildly positive
+(5,942 trades, 36.3% win rate, mean +2.24%, profit factor 1.58), but it does not survive the
+option vehicle at the pinned friction — through a synthetic one-year 0.70Δ call the same
+signal returns a mean of −2.26% with a profit factor of 0.89, and it is profitable only at
+h = 0, i.e. assuming fills at model mid with no spread at all. SPY returned 15.32% a year over
+the same window. The full result, every sensitivity, and the bias register listing each
+approximation with the direction it pushes the number are in
+[`docs/backtest/2026-08-16/report.md`](docs/backtest/2026-08-16/report.md).
 
 ## Status
 

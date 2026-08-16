@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from leaps_scanner import indicators, prices
@@ -736,3 +737,50 @@ def compute_coverage(
             for symbol in sorted(AUXILIARY_SYMBOLS)
         ),
     )
+
+
+class ChainCloses:
+    """Daily closes per rename chain, for §6.2's marks and §6.3.2's benchmark.
+
+    Non-finite and non-positive closes are dropped at load, which makes "the last
+    close at or before this session" true by construction: a bisect then lands on
+    a price that can actually mark a position, and a chain-specific halt holds the
+    previous mark instead of marking at NaN. Arrays are kept per chain (about
+    26 MB across the whole universe) because both callers read them in date order
+    across many chains at once, which a one-chain-at-a-time load cannot serve.
+    """
+
+    def __init__(self, cache: PriceCache) -> None:
+        self._cache = cache
+        self._series: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _load(self, chain: str) -> tuple[np.ndarray, np.ndarray]:
+        cached = self._series.get(chain)
+        if cached is not None:
+            return cached
+
+        frame = self._cache.load(chain)
+        if frame is None or frame.empty or "Close" not in frame:
+            empty = (np.array([], dtype="datetime64[D]"), np.array([], dtype="float64"))
+            self._series[chain] = empty
+            return empty
+
+        frame = frame.sort_index()
+        closes = frame["Close"].to_numpy(dtype="float64")
+        usable = np.isfinite(closes) & (closes > 0)
+        series = (
+            pd.DatetimeIndex(frame.index).to_numpy(dtype="datetime64[D]")[usable],
+            closes[usable],
+        )
+        self._series[chain] = series
+        return series
+
+    def close_on(self, chain: str, day: date) -> float | None:
+        """The last usable close at or before `day`, or None before the series starts."""
+        dates, closes = self._load(chain)
+        if dates.size == 0:
+            return None
+        position = int(np.searchsorted(dates, np.datetime64(day), side="right")) - 1
+        if position < 0:
+            return None
+        return float(closes[position])
