@@ -85,6 +85,28 @@ class Membership:
 
     spans: tuple[MembershipSpan, ...]
 
+    def __post_init__(self) -> None:
+        """Group the spans by symbol once, at construction.
+
+        Every per-symbol question below (`spans_for`, `span_on`,
+        `_span_added_on`) is asked once per member-week — a quarter of a million
+        times for the ten-year window, and several times that once §4's event
+        loop steps daily. Answering each by walking all ~900 spans is what makes
+        `compute_coverage` almost entirely a linear scan; answering it from this
+        index walks the one-to-three spans the symbol actually has.
+
+        Insertion order is preserved per symbol, so every lookup returns exactly
+        what the linear scan returned — §10.1's byte-identical reruns depend on
+        that. Not a field: it is derived from `spans`, and adding it to the
+        dataclass would put it in `__eq__` and the repr. Hence the frozen-safe
+        `object.__setattr__`.
+        """
+        by_symbol: dict[str, list[MembershipSpan]] = {}
+        for span in self.spans:
+            by_symbol.setdefault(span.symbol, []).append(span)
+        index = {symbol: tuple(symbol_spans) for symbol, symbol_spans in by_symbol.items()}
+        object.__setattr__(self, "_by_symbol", index)
+
     @classmethod
     def load(cls, path: Path | None = None) -> Membership:
         return cls(spans=tuple(load_spans(path)))
@@ -94,7 +116,7 @@ class Membership:
         return tuple(sorted({span.symbol for span in self.spans}))
 
     def spans_for(self, symbol: str) -> tuple[MembershipSpan, ...]:
-        return tuple(span for span in self.spans if span.symbol == symbol)
+        return self._by_symbol.get(symbol, ())
 
     def members_on(self, day: date) -> tuple[str, ...]:
         """Symbols in the index on `day`, sorted — determinism starts here."""
@@ -111,8 +133,8 @@ class Membership:
         unambiguous — which is what lets a recycled ticker resolve to the right
         company rather than to whichever span happened to be found first.
         """
-        for span in self.spans:
-            if span.symbol == symbol and span.covers(day):
+        for span in self._by_symbol.get(symbol, ()):
+            if span.covers(day):
                 return span
         return None
 
@@ -162,8 +184,8 @@ class Membership:
     def _span_added_on(self, symbol: str, day: date | None) -> MembershipSpan | None:
         if day is None:
             return None
-        for span in self.spans:
-            if span.symbol == symbol and span.added == day:
+        for span in self._by_symbol.get(symbol, ()):
+            if span.added == day:
                 return span
         return None
 
