@@ -127,9 +127,7 @@ screener but cannot complete a magic link.
 
 ## Deploying
 
-The web app deploys to Vercel from `apps/web`. There is deliberately no `vercel.json`: the only
-setting this monorepo needs is the root directory, which is a project setting rather than a file,
-and an otherwise-empty config committed next to it would just be a second place to look.
+The web app deploys to Vercel from `apps/web`.
 
 1. **New Project** → import this repository.
 2. Set **Root Directory** to `apps/web`. Next.js, the build command, and the output directory are
@@ -141,6 +139,22 @@ and an otherwise-empty config committed next to it would just be a second place 
 4. Add `https://<your-domain>/auth/callback` to Supabase's **Authentication → URL Configuration →
    Redirect URLs**, alongside the localhost entry. Until it is there, sign-in works locally and
    fails in production.
+5. **Check `apps/web/vercel.json` names the region your Supabase project lives in.** It ships
+   pinned to `sin1` (Singapore); change it if yours is elsewhere.
+
+### Why the region is pinned
+
+Every page except `/about` is a server component that reads Supabase before it can render, and
+Vercel defaults new projects to `iad1` regardless of where the database is. Deployed that way
+against a Singapore database, the screener took **2.1–3.7s**: `loadScreener` makes three
+sequential round trips, and each one crossed the Pacific at roughly 230ms instead of 40ms.
+`/about`, which reads nothing, served in 50ms on the same deployment — the latency was never the
+framework, only the distance.
+
+So the region is not a tuning knob here; it is the difference between meeting
+[SPEC.md §10](SPEC.md)'s "screener loads < 1s" and missing it by threefold. Pinning it in a file
+rather than the dashboard keeps it visible to anyone reading the repo, and reviewable when it
+changes.
 
 The build runs without Supabase configured — CI proves this on every pull request — so a missing
 variable surfaces as an "unconfigured" notice on the page rather than a failed deploy. That is
