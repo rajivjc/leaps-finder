@@ -21,11 +21,13 @@
       "correlations": {
         "holding_days": {
           "p_value": 0.0,
-          "spearman": 0.4005490919
+          "spearman": 0.4005490919,
+          "trades": 5942
         },
         "market_delta": {
           "p_value": 0.0,
-          "spearman": -0.1382940819
+          "spearman": -0.1382940819,
+          "trades": 5942
         },
         "r_overlay": {
           "p_value": 0.0,
@@ -34,7 +36,8 @@
         },
         "r_trade": {
           "p_value": 0.0,
-          "spearman": -0.10732333
+          "spearman": -0.10732333,
+          "trades": 5942
         }
       },
       "deciles": [
@@ -211,11 +214,13 @@
           "correlations": {
             "holding_days": {
               "p_value": 0.0,
-              "spearman": 0.3743723745
+              "spearman": 0.3743723745,
+              "trades": 2680
             },
             "market_delta": {
               "p_value": 0.0,
-              "spearman": -0.169568048
+              "spearman": -0.169568048,
+              "trades": 2680
             },
             "r_overlay": {
               "p_value": 0.0,
@@ -224,7 +229,8 @@
             },
             "r_trade": {
               "p_value": 0.0,
-              "spearman": -0.1572229813
+              "spearman": -0.1572229813,
+              "trades": 2680
             }
           },
           "tail_10pct": {
@@ -239,11 +245,13 @@
           "correlations": {
             "holding_days": {
               "p_value": 0.0,
-              "spearman": 0.4182998709
+              "spearman": 0.4182998709,
+              "trades": 3262
             },
             "market_delta": {
               "p_value": 0.0,
-              "spearman": -0.115361151
+              "spearman": -0.115361151,
+              "trades": 3262
             },
             "r_overlay": {
               "p_value": 0.0,
@@ -252,7 +260,8 @@
             },
             "r_trade": {
               "p_value": 9.59183e-05,
-              "spearman": -0.068243213
+              "spearman": -0.068243213,
+              "trades": 3262
             }
           },
           "tail_10pct": {
@@ -285,11 +294,13 @@
       "correlations": {
         "holding_days": {
           "p_value": 6.2825e-05,
-          "spearman": -0.0518923139
+          "spearman": -0.0518923139,
+          "trades": 5942
         },
         "market_delta": {
           "p_value": 0.3082525804,
-          "spearman": 0.0132201299
+          "spearman": 0.0132201299,
+          "trades": 5942
         },
         "r_overlay": {
           "p_value": 0.0076430783,
@@ -298,7 +309,8 @@
         },
         "r_trade": {
           "p_value": 0.1892051162,
-          "spearman": 0.0170347793
+          "spearman": 0.0170347793,
+          "trades": 5942
         }
       },
       "deciles": [
@@ -443,11 +455,13 @@
           "correlations": {
             "holding_days": {
               "p_value": 0.4874386232,
-              "spearman": -0.0134189398
+              "spearman": -0.0134189398,
+              "trades": 2680
             },
             "market_delta": {
               "p_value": 7.74027e-05,
-              "spearman": 0.0762697507
+              "spearman": 0.0762697507,
+              "trades": 2680
             },
             "r_overlay": {
               "p_value": 1.6653e-06,
@@ -456,7 +470,8 @@
             },
             "r_trade": {
               "p_value": 9.82801e-05,
-              "spearman": 0.0751632361
+              "spearman": 0.0751632361,
+              "trades": 2680
             }
           },
           "tail_10pct": {
@@ -471,11 +486,13 @@
           "correlations": {
             "holding_days": {
               "p_value": 1.3516e-06,
-              "spearman": -0.0844840466
+              "spearman": -0.0844840466,
+              "trades": 3262
             },
             "market_delta": {
               "p_value": 0.02157351,
-              "spearman": -0.0402309015
+              "spearman": -0.0402309015,
+              "trades": 3262
             },
             "r_overlay": {
               "p_value": 0.4653277516,
@@ -484,7 +501,8 @@
             },
             "r_trade": {
               "p_value": 0.0731379936,
-              "spearman": -0.0313796393
+              "spearman": -0.0313796393,
+              "trades": 3262
             }
           },
           "tail_10pct": {

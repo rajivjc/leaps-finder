@@ -206,6 +206,34 @@ class TestStatistics:
     def test_tail_spread_reports_none_without_priced_trades(self) -> None:
         assert subscore.tail_spread([], "s_trend", 0.1)["observed"] is None
 
+    def test_a_missing_benchmark_only_blanks_the_benchmark_correlation(self, scored) -> None:
+        """§3.5 lets a run continue with no SPY cached.
+
+        `r_trade` and `holding_days` need no benchmark, so they must survive
+        that — otherwise a thin SPY cache silently erases the duration
+        relationship while the report still renders as a complete result.
+        """
+        _, trades, cache = scored
+        without = subscore.score_trades(trades, cache, metrics.BenchmarkPrices(None))
+        assert without.unpriced_benchmark == len(trades), "benchmark should price nothing here"
+
+        correlation = subscore.correlations(without.scored, "s_trend")
+        assert correlation["market_delta"]["spearman"] is None
+        assert correlation["market_delta"]["trades"] == 0
+        for name in ("r_trade", "holding_days"):
+            assert correlation[name]["spearman"] is not None, f"{name} needs no benchmark"
+            assert correlation[name]["trades"] == len(without.scored)
+
+    def test_each_correlation_reports_its_own_denominator(self, scored) -> None:
+        result, _, _ = scored
+        correlation = subscore.correlations(result.scored, "s_trend")
+        priced = sum(1 for row in result.scored if row.market_delta is not None)
+        overlaid = sum(1 for row in result.scored if row.r_overlay is not None)
+
+        assert correlation["market_delta"]["trades"] == priced
+        assert correlation["r_overlay"]["trades"] == overlaid
+        assert correlation["r_trade"]["trades"] == len(result.scored)
+
 
 class TestArtifacts:
     def test_payload_round_trips_and_is_byte_stable(self, scored) -> None:

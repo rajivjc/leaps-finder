@@ -45,12 +45,12 @@ Distribution: mean 37.0, median 32.0, range 0.0–100.0.
 | 60.9–74.5 | 594 | 40.2% | +3.56% | -3.28% | 1.68 | +0.10% | [-1.39%, +1.60%] | -4.09% | +2.34% | 29.0% |
 | 74.5–100.0 | 595 | 40.8% | +3.05% | -3.29% | 1.53 | -1.16% | [-3.09%, +1.04%] | -5.25% | -3.25% | 27.1% |
 
-| Against | Spearman | p (independence assumed) |
-|---|---|---|
-| market_delta | -0.1383 | 9.18e-27 |
-| r_trade | -0.1073 | 1.08e-16 |
-| holding_days | 0.4005 | 7.02e-228 |
-| r_overlay | -0.1717 | 1.56e-40 |
+| Against | n | Spearman | p (independence assumed) |
+|---|---|---|---|
+| market_delta | 5942 | -0.1383 | 9.18e-27 |
+| r_trade | 5942 | -0.1073 | 1.08e-16 |
+| holding_days | 5942 | 0.4005 | 7.02e-228 |
+| r_overlay | 5939 | -0.1717 | 1.56e-40 |
 
 Top-minus-bottom mean market delta, with the cut recomputed inside every replicate:
 
@@ -81,12 +81,12 @@ Distribution: mean 81.4, median 82.9, range 15.3–100.0.
 | 92.6–100.0 | 459 | 34.9% | +2.14% | -2.91% | 1.53 | -0.39% | [-1.58%, +0.86%] | -2.54% | -1.94% | 20.9% |
 | 100.0–100.0 | 1918 | 36.3% | +1.98% | -2.36% | 1.54 | -0.73% | [-1.38%, +0.01%] | -3.02% | -1.59% | 18.4% |
 
-| Against | Spearman | p (independence assumed) |
-|---|---|---|
-| market_delta | 0.0132 | 0.308 |
-| r_trade | 0.0170 | 0.189 |
-| holding_days | -0.0519 | 6.28e-05 |
-| r_overlay | 0.0346 | 0.00764 |
+| Against | n | Spearman | p (independence assumed) |
+|---|---|---|---|
+| market_delta | 5942 | 0.0132 | 0.308 |
+| r_trade | 5942 | 0.0170 | 0.189 |
+| holding_days | 5942 | -0.0519 | 6.28e-05 |
+| r_overlay | 5939 | 0.0346 | 0.00764 |
 
 Top-minus-bottom mean market delta, with the cut recomputed inside every replicate:
 

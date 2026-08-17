@@ -230,17 +230,18 @@ def _run_engine(
     for item in stats:
         print(_track_a_line(item), file=sys.stderr)
 
-    if args.subscore_dir:
-        _run_subscore(result, overlays, cache, coverage, args.subscore_dir)
-
     if args.no_sleeve or not overlays:
+        status = 0
         if args.report_dir:
             logger.error(
                 "--report-dir needs the sleeve and the overlay, but %s was passed: nothing written",
                 "--no-sleeve" if args.no_sleeve else "--no-overlay",
             )
-            return 1
-        return 0
+            status = 1
+        # The analysis needs only the stock track, so it runs on this path too.
+        if args.subscore_dir:
+            _run_subscore(result, overlays, cache, coverage, args.subscore_dir)
+        return status
 
     sleeves, benchmarks, calendar, unlabelled = _run_sleeve(
         result, overlays, cache, window, coverage
@@ -266,6 +267,13 @@ def _run_engine(
             directory,
         )
         print(f"wrote {len(written)} files to {directory}", file=sys.stderr)
+
+    # Last, and deliberately after §8's write: the subscore analysis is not part
+    # of the published run, so a failure in it must never cost the report. It is
+    # still allowed to raise — an `AlignmentError` means the cache no longer
+    # reproduces the recorded signals, which is worth stopping for.
+    if args.subscore_dir:
+        _run_subscore(result, overlays, cache, coverage, args.subscore_dir)
     return 0
 
 
@@ -311,11 +319,18 @@ def _run_subscore(
 
 
 def _subscore_line(scored: subscore.ScoreResult) -> str:
+    """The gate's result, counted rather than asserted.
+
+    "alignment gate passed" on its own would read as "every trade was verified"
+    even on a run where some were skipped before reaching the check. Only the
+    scored ones were gated, so only they are claimed.
+    """
     return (
         f"subscore: scored {len(scored.scored)} of {scored.trades_in} base trades "
         f"(insufficient history {scored.insufficient_history}, "
         f"unpriced chains {scored.unpriced_chains}, "
-        f"overlay matched {scored.overlay_matched}); alignment gate passed"
+        f"overlay matched {scored.overlay_matched}); "
+        f"alignment gate passed on {len(scored.scored)} of {scored.trades_in}"
     )
 
 

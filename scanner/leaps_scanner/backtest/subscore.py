@@ -444,24 +444,36 @@ def _spread(values: np.ndarray, deltas: np.ndarray, share: float) -> float:
 
 
 def correlations(rows: Sequence[ScoredTrade], field: str) -> dict:
-    """Rank correlations of one subscore against the outcomes that matter."""
-    priced = [row for row in rows if row.market_delta is not None]
-    scores = [getattr(row, field) for row in priced]
-    out: dict[str, dict[str, float | None]] = {}
-    for name, series in (
-        ("market_delta", [row.market_delta for row in priced]),
-        ("r_trade", [row.r_trade for row in priced]),
-        ("holding_days", [float(row.holding_days) for row in priced]),
-    ):
-        rho, p_value = _spearman(scores, series)
-        out[name] = {"spearman": rho, "p_value": p_value}
+    """Rank correlations of one subscore against the outcomes that matter.
 
-    with_overlay = [row for row in rows if row.r_overlay is not None]
-    rho, p_value = _spearman(
-        [getattr(row, field) for row in with_overlay],
-        [row.r_overlay for row in with_overlay],
-    )
-    out["r_overlay"] = {"spearman": rho, "p_value": p_value, "trades": len(with_overlay)}
+    Each outcome is measured over the trades that actually have it, not over the
+    intersection of all of them. `r_trade` and `holding_days` need no benchmark,
+    so restricting them to benchmark-priced trades would let a thin SPY cache
+    quietly null out the duration relationship — the one real finding here —
+    while the report still rendered as a complete result. §3.5 permits a run with
+    no benchmark at all, which is exactly when that would bite hardest.
+
+    `trades` travels with every correlation for the same reason the bucket
+    tables carry their own `n`: a correlation over a silently smaller sample is
+    the "partial data looking complete" CLAUDE.md forbids.
+    """
+    out: dict[str, dict[str, float | None]] = {}
+    for name, subset, series in (
+        (
+            "market_delta",
+            (priced := [row for row in rows if row.market_delta is not None]),
+            [row.market_delta for row in priced],
+        ),
+        ("r_trade", rows, [row.r_trade for row in rows]),
+        ("holding_days", rows, [float(row.holding_days) for row in rows]),
+        (
+            "r_overlay",
+            (overlaid := [row for row in rows if row.r_overlay is not None]),
+            [row.r_overlay for row in overlaid],
+        ),
+    ):
+        rho, p_value = _spearman([getattr(row, field) for row in subset], series)
+        out[name] = {"spearman": rho, "p_value": p_value, "trades": len(subset)}
     return out
 
 
@@ -627,10 +639,20 @@ def _p_value(value: float | None) -> str:
 
 
 def _correlation_table(correlation: Mapping[str, Mapping[str, object]]) -> str:
+    """Each correlation with the `n` it was measured over.
+
+    The counts differ by row on purpose — see `correlations` — so printing one
+    denominator for the table would misdescribe every row but the first.
+    """
     return _table(
-        ["Against", "Spearman", "p (independence assumed)"],
+        ["Against", "n", "Spearman", "p (independence assumed)"],
         [
-            [name, _num(item["spearman"], 4), _p_value(item["p_value"])]  # type: ignore[arg-type]
+            [
+                name,
+                str(item["trades"]),
+                _num(item["spearman"], 4),  # type: ignore[arg-type]
+                _p_value(item["p_value"]),  # type: ignore[arg-type]
+            ]
             for name, item in correlation.items()
         ],
     )
