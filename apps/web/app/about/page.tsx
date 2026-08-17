@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import Link from "next/link";
 
 export const metadata: Metadata = {
   title: "About · LEAPS Finder",
@@ -128,6 +129,12 @@ cushion       = (target_adj - breakeven) / breakeven`}</Formula>
             instead of the stock.
           </p>
           <p>
+            One limit on that result: the backtest enters on the trend and stochastic signals
+            alone, without the liquidity, volatility, earnings-distance and quality gates the
+            presets add. So the tested population is broader than, and not identical to, the
+            names this screener shows you.
+          </p>
+          <p>
             <strong className="text-[var(--foreground)]">
               The other 60% — Quality, Option economics and Valuation — has never been tested at
               all.
@@ -145,15 +152,15 @@ cushion       = (target_adj - breakeven) / breakeven`}</Formula>
             order a filtered list, not as evidence that the names at the top will do better.
           </p>
           <p>
-            The timing signal underneath all of this was also evaluated over the same ten years,
-            and did not beat a buy-and-hold of the same names. Those results, with every
-            approximation behind them, are on the{" "}
-            <a
+            The timing signal underneath all of this was evaluated over the same ten years too:
+            measured trade by trade, it did not beat simply holding the market over the same
+            days. Those results, with every approximation behind them, are on the{" "}
+            <Link
               className="underline underline-offset-2 hover:text-[var(--foreground)]"
               href="/backtest"
             >
               backtest page
-            </a>
+            </Link>
             .
           </p>
         </Caveat>
