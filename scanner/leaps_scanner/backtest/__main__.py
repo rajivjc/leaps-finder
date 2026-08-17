@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
 
-from leaps_scanner.backtest import data, engine, metrics, report, sleeve, synthetic
+from leaps_scanner.backtest import data, engine, metrics, report, sleeve, subscore, synthetic
 from leaps_scanner.backtest.membership import Membership
 
 logger = logging.getLogger("leaps_scanner.backtest")
@@ -94,6 +94,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-sleeve",
         action="store_true",
         help="skip §6.2's sleeve simulation and §6.3's benchmarks",
+    )
+    parser.add_argument(
+        "--subscore-dir",
+        type=Path,
+        default=None,
+        help=(
+            "score every base-variant trade with SPEC.md §6's Trend and Entry subscores "
+            "as of its signal date and write the analysis under <dir>/<run-date>-subscore/ "
+            "(analysis, not part of §8's published run)"
+        ),
     )
     return parser
 
@@ -221,13 +231,17 @@ def _run_engine(
         print(_track_a_line(item), file=sys.stderr)
 
     if args.no_sleeve or not overlays:
+        status = 0
         if args.report_dir:
             logger.error(
                 "--report-dir needs the sleeve and the overlay, but %s was passed: nothing written",
                 "--no-sleeve" if args.no_sleeve else "--no-overlay",
             )
-            return 1
-        return 0
+            status = 1
+        # The analysis needs only the stock track, so it runs on this path too.
+        if args.subscore_dir:
+            _run_subscore(result, overlays, cache, coverage, args.subscore_dir)
+        return status
 
     sleeves, benchmarks, calendar, unlabelled = _run_sleeve(
         result, overlays, cache, window, coverage
@@ -253,11 +267,71 @@ def _run_engine(
             directory,
         )
         print(f"wrote {len(written)} files to {directory}", file=sys.stderr)
+
+    # Last, and deliberately after §8's write: the subscore analysis is not part
+    # of the published run, so a failure in it must never cost the report. It is
+    # still allowed to raise — an `AlignmentError` means the cache no longer
+    # reproduces the recorded signals, which is worth stopping for.
+    if args.subscore_dir:
+        _run_subscore(result, overlays, cache, coverage, args.subscore_dir)
     return 0
 
 
 def _run_date_of(coverage: data.Coverage) -> str:
     return coverage.run_date.isoformat()
+
+
+def _run_subscore(
+    result: engine.EngineResult,
+    overlays: Sequence[synthetic.LeapOverlay],
+    cache: data.PriceCache,
+    coverage: data.Coverage,
+    directory: Path,
+) -> None:
+    """Score the base variant's trades with §6's Trend and Entry (analysis only).
+
+    The base zone variant alone: P13 reports Strict alongside as a sensitivity,
+    and running the analysis over both would invite picking the flattering one.
+    The overlay return is attached on `(chain, entry_date)` — the §2.3a-safe key,
+    since a chain outlives the ticker it traded under.
+
+    Writes under its own dated directory rather than into §8's published run,
+    which this must not disturb.
+    """
+    trades = result.trades[subscore.VARIANT]
+    base = next((item for item in overlays if item.name == "base"), None)
+    overlay_returns = (
+        {}
+        if base is None
+        else {(item.trade.chain, item.trade.entry_date): item.r_overlay for item in base.trades}
+    )
+
+    scored = subscore.score_trades(
+        trades,
+        cache,
+        metrics.BenchmarkPrices(cache.load_benchmark()),
+        overlay_returns=overlay_returns,
+    )
+    payload = subscore.build_results(scored, run_date=coverage.run_date, variant=subscore.VARIANT)
+    written = subscore.write_report(payload, directory / f"{_run_date_of(coverage)}-subscore")
+    print(_subscore_line(scored), file=sys.stderr)
+    print(f"wrote {len(written)} subscore files", file=sys.stderr)
+
+
+def _subscore_line(scored: subscore.ScoreResult) -> str:
+    """The gate's result, counted rather than asserted.
+
+    "alignment gate passed" on its own would read as "every trade was verified"
+    even on a run where some were skipped before reaching the check. Only the
+    scored ones were gated, so only they are claimed.
+    """
+    return (
+        f"subscore: scored {len(scored.scored)} of {scored.trades_in} base trades "
+        f"(insufficient history {scored.insufficient_history}, "
+        f"unpriced chains {scored.unpriced_chains}, "
+        f"overlay matched {scored.overlay_matched}); "
+        f"alignment gate passed on {len(scored.scored)} of {scored.trades_in}"
+    )
 
 
 def _run_sleeve(

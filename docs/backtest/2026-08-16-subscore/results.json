@@ -1,0 +1,545 @@
+{
+  "bootstrap": {
+    "block": "entry month",
+    "confidence": 0.95,
+    "replicates": 10000,
+    "seed": 20260817
+  },
+  "gate": {
+    "alignment": "every scored trade's recomputed slowK equals the engine's entry_slow_k",
+    "insufficient_history": 0,
+    "market_delta_unpriced": 0,
+    "overlay_matched": 5939,
+    "scored": 5942,
+    "trades_in": 5942,
+    "unpriced_chains": 0
+  },
+  "generated_by": "python -m leaps_scanner.backtest --subscore-dir",
+  "run_date": "2026-08-16",
+  "subscores": [
+    {
+      "correlations": {
+        "holding_days": {
+          "p_value": 0.0,
+          "spearman": 0.4005490919,
+          "trades": 5942
+        },
+        "market_delta": {
+          "p_value": 0.0,
+          "spearman": -0.1382940819,
+          "trades": 5942
+        },
+        "r_overlay": {
+          "p_value": 0.0,
+          "spearman": -0.1717136289,
+          "trades": 5939
+        },
+        "r_trade": {
+          "p_value": 0.0,
+          "spearman": -0.10732333,
+          "trades": 5942
+        }
+      },
+      "deciles": [
+        {
+          "bucket": "0.0\u20137.6",
+          "held_to_time_exit": 0.0655462185,
+          "market_delta_ci_high": 0.0015398454,
+          "market_delta_ci_low": -0.0115792065,
+          "market_delta_mean": -0.0051494669,
+          "market_delta_median": -0.0104095439,
+          "market_delta_priced": 595,
+          "mean_holding_days": 33.0705882353,
+          "mean_return": 0.0080761318,
+          "median_return": -0.0110301864,
+          "overlay_mean": -0.0536594299,
+          "profit_factor": 1.453215179,
+          "trades": 595,
+          "win_rate": 0.3462184874
+        },
+        {
+          "bucket": "7.6\u201313.1",
+          "held_to_time_exit": 0.0993265993,
+          "market_delta_ci_high": 0.0040543849,
+          "market_delta_ci_low": -0.0113358536,
+          "market_delta_mean": -0.0037954262,
+          "market_delta_median": -0.0214271131,
+          "market_delta_priced": 594,
+          "mean_holding_days": 52.9528619529,
+          "mean_return": 0.0090960821,
+          "median_return": -0.0227999308,
+          "overlay_mean": -0.0641454983,
+          "profit_factor": 1.3390483872,
+          "trades": 594,
+          "win_rate": 0.297979798
+        },
+        {
+          "bucket": "13.1\u201318.7",
+          "held_to_time_exit": 0.1397306397,
+          "market_delta_ci_high": 0.0056591583,
+          "market_delta_ci_low": -0.0128590141,
+          "market_delta_mean": -0.003808946,
+          "market_delta_median": -0.0299371784,
+          "market_delta_priced": 594,
+          "mean_holding_days": 71.2053872054,
+          "mean_return": 0.0168892127,
+          "median_return": -0.0274317863,
+          "overlay_mean": -0.0330569393,
+          "profit_factor": 1.5298490826,
+          "trades": 594,
+          "win_rate": 0.3316498316
+        },
+        {
+          "bucket": "18.7\u201325.1",
+          "held_to_time_exit": 0.1919191919,
+          "market_delta_ci_high": 0.0112976228,
+          "market_delta_ci_low": -0.010321474,
+          "market_delta_mean": 0.0002508378,
+          "market_delta_median": -0.029847153,
+          "market_delta_priced": 594,
+          "mean_holding_days": 80.4713804714,
+          "mean_return": 0.0261118064,
+          "median_return": -0.0321169688,
+          "overlay_mean": 0.0063766211,
+          "profit_factor": 1.7550953429,
+          "trades": 594,
+          "win_rate": 0.3653198653
+        },
+        {
+          "bucket": "25.1\u201332.0",
+          "held_to_time_exit": 0.1767676768,
+          "market_delta_ci_high": -0.005425337,
+          "market_delta_ci_low": -0.0212706748,
+          "market_delta_mean": -0.0134299505,
+          "market_delta_median": -0.0392694775,
+          "market_delta_priced": 594,
+          "mean_holding_days": 81.2104377104,
+          "mean_return": 0.0098839603,
+          "median_return": -0.0366860427,
+          "overlay_mean": -0.0656292214,
+          "profit_factor": 1.2560907287,
+          "trades": 594,
+          "win_rate": 0.3383838384
+        },
+        {
+          "bucket": "32.1\u201340.4",
+          "held_to_time_exit": 0.234006734,
+          "market_delta_ci_high": 0.0168677784,
+          "market_delta_ci_low": -0.0094467267,
+          "market_delta_mean": 0.0032361719,
+          "market_delta_median": -0.0326101208,
+          "market_delta_priced": 594,
+          "mean_holding_days": 91.4494949495,
+          "mean_return": 0.032694872,
+          "median_return": -0.0366418269,
+          "overlay_mean": 0.0036260469,
+          "profit_factor": 1.796631947,
+          "trades": 594,
+          "win_rate": 0.3686868687
+        },
+        {
+          "bucket": "40.4\u201350.3",
+          "held_to_time_exit": 0.2222222222,
+          "market_delta_ci_high": 0.0052936815,
+          "market_delta_ci_low": -0.0174455185,
+          "market_delta_mean": -0.0061922764,
+          "market_delta_median": -0.0382952962,
+          "market_delta_priced": 594,
+          "mean_holding_days": 97.1245791246,
+          "mean_return": 0.0230479786,
+          "median_return": -0.034799314,
+          "overlay_mean": -0.0140156028,
+          "profit_factor": 1.5647416387,
+          "trades": 594,
+          "win_rate": 0.3804713805
+        },
+        {
+          "bucket": "50.3\u201360.9",
+          "held_to_time_exit": 0.2609427609,
+          "market_delta_ci_high": 0.0066139064,
+          "market_delta_ci_low": -0.0183363747,
+          "market_delta_mean": -0.0060592385,
+          "market_delta_median": -0.0469317748,
+          "market_delta_priced": 594,
+          "mean_holding_days": 105.0404040404,
+          "mean_return": 0.0321188316,
+          "median_return": -0.0357617786,
+          "overlay_mean": -0.0003891055,
+          "profit_factor": 1.6783052767,
+          "trades": 594,
+          "win_rate": 0.3872053872
+        },
+        {
+          "bucket": "60.9\u201374.5",
+          "held_to_time_exit": 0.2895622896,
+          "market_delta_ci_high": 0.0160237574,
+          "market_delta_ci_low": -0.0138694679,
+          "market_delta_mean": 0.0010375193,
+          "market_delta_median": -0.0409299157,
+          "market_delta_priced": 594,
+          "mean_holding_days": 109.7121212121,
+          "mean_return": 0.0356087171,
+          "median_return": -0.0327611442,
+          "overlay_mean": 0.0233914904,
+          "profit_factor": 1.6790802763,
+          "trades": 594,
+          "win_rate": 0.4023569024
+        },
+        {
+          "bucket": "74.5\u2013100.0",
+          "held_to_time_exit": 0.2705882353,
+          "market_delta_ci_high": 0.0104239307,
+          "market_delta_ci_low": -0.0309174486,
+          "market_delta_mean": -0.0115568334,
+          "market_delta_median": -0.0524740097,
+          "market_delta_priced": 595,
+          "mean_holding_days": 113.4403361345,
+          "mean_return": 0.0304733424,
+          "median_return": -0.0329311877,
+          "overlay_mean": -0.0325179781,
+          "profit_factor": 1.5291772692,
+          "trades": 595,
+          "win_rate": 0.4084033613
+        }
+      ],
+      "distribution": {
+        "max": 100.0,
+        "mean": 37.019874832,
+        "median": 32.0489676853,
+        "min": 0.0
+      },
+      "field": "s_trend",
+      "held_out": {
+        "held_out": {
+          "correlations": {
+            "holding_days": {
+              "p_value": 0.0,
+              "spearman": 0.3743723745,
+              "trades": 2680
+            },
+            "market_delta": {
+              "p_value": 0.0,
+              "spearman": -0.169568048,
+              "trades": 2680
+            },
+            "r_overlay": {
+              "p_value": 0.0,
+              "spearman": -0.2248026757,
+              "trades": 2680
+            },
+            "r_trade": {
+              "p_value": 0.0,
+              "spearman": -0.1572229813,
+              "trades": 2680
+            }
+          },
+          "tail_10pct": {
+            "ci_high": 0.0424802084,
+            "ci_low": -0.0427381913,
+            "observed": -0.004829997,
+            "share": 0.1
+          },
+          "trades": 2680
+        },
+        "in_sample": {
+          "correlations": {
+            "holding_days": {
+              "p_value": 0.0,
+              "spearman": 0.4182998709,
+              "trades": 3262
+            },
+            "market_delta": {
+              "p_value": 0.0,
+              "spearman": -0.115361151,
+              "trades": 3262
+            },
+            "r_overlay": {
+              "p_value": 0.0,
+              "spearman": -0.1311707756,
+              "trades": 3259
+            },
+            "r_trade": {
+              "p_value": 9.59183e-05,
+              "spearman": -0.068243213,
+              "trades": 3262
+            }
+          },
+          "tail_10pct": {
+            "ci_high": 0.0084345922,
+            "ci_low": -0.0311674022,
+            "observed": -0.0117317801,
+            "share": 0.1
+          },
+          "trades": 3262
+        },
+        "split_year": 2022
+      },
+      "tails": [
+        {
+          "ci_high": 0.0098958526,
+          "ci_low": -0.0152239867,
+          "observed": -0.0027570389,
+          "share": 0.25
+        },
+        {
+          "ci_high": 0.0177448378,
+          "ci_low": -0.0266337345,
+          "observed": -0.0064073664,
+          "share": 0.1
+        }
+      ],
+      "trades": 5942
+    },
+    {
+      "correlations": {
+        "holding_days": {
+          "p_value": 6.2825e-05,
+          "spearman": -0.0518923139,
+          "trades": 5942
+        },
+        "market_delta": {
+          "p_value": 0.3082525804,
+          "spearman": 0.0132201299,
+          "trades": 5942
+        },
+        "r_overlay": {
+          "p_value": 0.0076430783,
+          "spearman": 0.0346098598,
+          "trades": 5939
+        },
+        "r_trade": {
+          "p_value": 0.1892051162,
+          "spearman": 0.0170347793,
+          "trades": 5942
+        }
+      },
+      "deciles": [
+        {
+          "bucket": "15.3\u201355.4",
+          "held_to_time_exit": 0.2268907563,
+          "market_delta_ci_high": 0.0154834804,
+          "market_delta_ci_low": -0.0121070064,
+          "market_delta_mean": 0.0012807376,
+          "market_delta_median": -0.0270279065,
+          "market_delta_priced": 595,
+          "mean_holding_days": 86.5075630252,
+          "mean_return": 0.0298910995,
+          "median_return": -0.0271526701,
+          "overlay_mean": -0.0052338832,
+          "profit_factor": 1.6983946199,
+          "trades": 595,
+          "win_rate": 0.3579831933
+        },
+        {
+          "bucket": "55.4\u201363.1",
+          "held_to_time_exit": 0.2104377104,
+          "market_delta_ci_high": 0.0032177689,
+          "market_delta_ci_low": -0.0262110411,
+          "market_delta_mean": -0.0121271735,
+          "market_delta_median": -0.0346931106,
+          "market_delta_priced": 594,
+          "mean_holding_days": 92.9528619529,
+          "mean_return": 0.0208944238,
+          "median_return": -0.0306180591,
+          "overlay_mean": -0.0496768707,
+          "profit_factor": 1.4869512975,
+          "trades": 594,
+          "win_rate": 0.3518518519
+        },
+        {
+          "bucket": "63.1\u201371.1",
+          "held_to_time_exit": 0.2070707071,
+          "market_delta_ci_high": 0.0084605597,
+          "market_delta_ci_low": -0.0118161107,
+          "market_delta_mean": -0.0019557665,
+          "market_delta_median": -0.0272269498,
+          "market_delta_priced": 594,
+          "mean_holding_days": 88.7441077441,
+          "mean_return": 0.0278656028,
+          "median_return": -0.0217138909,
+          "overlay_mean": -0.0163810218,
+          "profit_factor": 1.7299065669,
+          "trades": 594,
+          "win_rate": 0.3872053872
+        },
+        {
+          "bucket": "71.1\u201379.6",
+          "held_to_time_exit": 0.1818181818,
+          "market_delta_ci_high": 0.0078448706,
+          "market_delta_ci_low": -0.0188400561,
+          "market_delta_mean": -0.0060612717,
+          "market_delta_median": -0.0338185004,
+          "market_delta_priced": 594,
+          "mean_holding_days": 84.4528619529,
+          "mean_return": 0.0197658563,
+          "median_return": -0.0283878845,
+          "overlay_mean": -0.0469929329,
+          "profit_factor": 1.5119006687,
+          "trades": 594,
+          "win_rate": 0.3535353535
+        },
+        {
+          "bucket": "79.6\u201382.9",
+          "held_to_time_exit": 0.1531986532,
+          "market_delta_ci_high": 0.0123520105,
+          "market_delta_ci_low": -0.010945245,
+          "market_delta_mean": 0.0003534681,
+          "market_delta_median": -0.0228947243,
+          "market_delta_priced": 594,
+          "mean_holding_days": 70.1279461279,
+          "mean_return": 0.0164353187,
+          "median_return": -0.0224450026,
+          "overlay_mean": -0.0348197168,
+          "profit_factor": 1.4536995715,
+          "trades": 594,
+          "win_rate": 0.3585858586
+        },
+        {
+          "bucket": "82.9\u201392.6",
+          "held_to_time_exit": 0.2171717172,
+          "market_delta_ci_high": 0.0143440834,
+          "market_delta_ci_low": -0.0149227674,
+          "market_delta_mean": -0.0003690443,
+          "market_delta_median": -0.0297290227,
+          "market_delta_priced": 594,
+          "mean_holding_days": 92.0875420875,
+          "mean_return": 0.0286544223,
+          "median_return": -0.0261061302,
+          "overlay_mean": -0.0106888396,
+          "profit_factor": 1.7100569238,
+          "trades": 594,
+          "win_rate": 0.3771043771
+        },
+        {
+          "bucket": "92.6\u2013100.0",
+          "held_to_time_exit": 0.2091503268,
+          "market_delta_ci_high": 0.0086480343,
+          "market_delta_ci_low": -0.0158169852,
+          "market_delta_mean": -0.0039328122,
+          "market_delta_median": -0.0254024498,
+          "market_delta_priced": 459,
+          "mean_holding_days": 83.7037037037,
+          "mean_return": 0.0213910834,
+          "median_return": -0.0291068626,
+          "overlay_mean": -0.01940474,
+          "profit_factor": 1.5251987696,
+          "trades": 459,
+          "win_rate": 0.348583878
+        },
+        {
+          "bucket": "100.0\u2013100.0",
+          "held_to_time_exit": 0.1835245047,
+          "market_delta_ci_high": 6.94869e-05,
+          "market_delta_ci_low": -0.0138443495,
+          "market_delta_mean": -0.0073026225,
+          "market_delta_median": -0.0302365853,
+          "market_delta_priced": 1918,
+          "mean_holding_days": 79.3524504692,
+          "mean_return": 0.0198142403,
+          "median_return": -0.023614402,
+          "overlay_mean": -0.0159212669,
+          "profit_factor": 1.5402239028,
+          "trades": 1918,
+          "win_rate": 0.3628779979
+        }
+      ],
+      "distribution": {
+        "max": 100.0,
+        "mean": 81.3733484344,
+        "median": 82.8570444599,
+        "min": 15.3374880539
+      },
+      "field": "s_entry",
+      "held_out": {
+        "held_out": {
+          "correlations": {
+            "holding_days": {
+              "p_value": 0.4874386232,
+              "spearman": -0.0134189398,
+              "trades": 2680
+            },
+            "market_delta": {
+              "p_value": 7.74027e-05,
+              "spearman": 0.0762697507,
+              "trades": 2680
+            },
+            "r_overlay": {
+              "p_value": 1.6653e-06,
+              "spearman": 0.092377911,
+              "trades": 2680
+            },
+            "r_trade": {
+              "p_value": 9.82801e-05,
+              "spearman": 0.0751632361,
+              "trades": 2680
+            }
+          },
+          "tail_10pct": {
+            "ci_high": 0.0426071111,
+            "ci_low": 0.0047583589,
+            "observed": 0.0232150562,
+            "share": 0.1
+          },
+          "trades": 2680
+        },
+        "in_sample": {
+          "correlations": {
+            "holding_days": {
+              "p_value": 1.3516e-06,
+              "spearman": -0.0844840466,
+              "trades": 3262
+            },
+            "market_delta": {
+              "p_value": 0.02157351,
+              "spearman": -0.0402309015,
+              "trades": 3262
+            },
+            "r_overlay": {
+              "p_value": 0.4653277516,
+              "spearman": -0.0127935275,
+              "trades": 3259
+            },
+            "r_trade": {
+              "p_value": 0.0731379936,
+              "spearman": -0.0313796393,
+              "trades": 3262
+            }
+          },
+          "tail_10pct": {
+            "ci_high": -0.0169768885,
+            "ci_low": -0.0533537231,
+            "observed": -0.0346048062,
+            "share": 0.1
+          },
+          "trades": 3262
+        },
+        "split_year": 2022
+      },
+      "tails": [
+        {
+          "ci_high": 0.0063943937,
+          "ci_low": -0.015853092,
+          "observed": -0.0045492515,
+          "share": 0.25
+        },
+        {
+          "ci_high": 0.0069631913,
+          "ci_low": -0.0233050604,
+          "observed": -0.0085833602,
+          "share": 0.1
+        }
+      ],
+      "trades": 5942
+    }
+  ],
+  "variant": "base",
+  "whole_sample": {
+    "chains": 569,
+    "market_delta_ci_high": 0.0010249946,
+    "market_delta_ci_low": -0.0099804044,
+    "market_delta_mean": -0.0045480421,
+    "market_delta_median": -0.0290522701,
+    "mean_return": 0.0223990416,
+    "trades": 5942
+  }
+}
