@@ -23,6 +23,20 @@ function Formula({ children }: { children: React.ReactNode }) {
   );
 }
 
+/**
+ * A boxed caveat inside a section, for a claim the reader needs before they
+ * trust the formulas around it. `h3` rather than `h2`: it sits under a
+ * section heading, and skipping a level would break the document outline.
+ */
+function Caveat({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div className="rounded-md border border-[var(--border)] bg-[var(--surface)] p-4">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
+      <div className="mt-2 space-y-3">{children}</div>
+    </div>
+  );
+}
+
 export default function AboutPage() {
   return (
     <div className="space-y-10">
@@ -95,6 +109,55 @@ cushion       = (target_adj - breakeven) / breakeven`}</Formula>
           + 0.20 * OptionEconomics
           + 0.15 * Valuation
           + 0.15 * Entry`}</Formula>
+
+        <Caveat title="How much of this score has actually been tested">
+          <p>
+            The formulas below describe how the score is <em>built</em>. Whether it predicts
+            anything is a separate question, and the honest answer is that most of it has never
+            been measured.
+          </p>
+          <p>
+            <strong className="text-[var(--foreground)]">
+              Trend and Entry — 40% of the composite — have been tested and show nothing.
+            </strong>{" "}
+            Both were recomputed for every trade in the ten-year backtest, at the historical date
+            the scanner would have scored it, and compared against how that trade went relative to
+            the market over the same days. There is no detectable relationship. Sorting trades by
+            Trend score does separate them by raw return, but not by return <em>versus the
+            market</em> — which is the only kind that pays for the cost of buying an option
+            instead of the stock.
+          </p>
+          <p>
+            <strong className="text-[var(--foreground)]">
+              The other 60% — Quality, Option economics and Valuation — has never been tested at
+              all.
+            </strong>{" "}
+            Doing so needs point-in-time fundamentals and historical option chains as they stood
+            on each past date, and this project has neither. That is the part of the score the
+            strategy actually rests on, and it is unmeasured rather than measured and found
+            wanting.
+          </p>
+          <p>
+            One thing this does <em>not</em> mean: that a high score is worse than a low one. The
+            preset filters run first, so the score only ever orders names that have already
+            cleared every gate. Asking which of several uptrends is the strongest uptrend simply
+            turns out not to be a useful question. Treat the composite as a consistent way to
+            order a filtered list, not as evidence that the names at the top will do better.
+          </p>
+          <p>
+            The timing signal underneath all of this was also evaluated over the same ten years,
+            and did not beat a buy-and-hold of the same names. Those results, with every
+            approximation behind them, are on the{" "}
+            <a
+              className="underline underline-offset-2 hover:text-[var(--foreground)]"
+              href="/backtest"
+            >
+              backtest page
+            </a>
+            .
+          </p>
+        </Caveat>
+
         <p>
           Every subscore is built from one helper, <code className="font-mono">clip_map</code>, a
           piecewise-linear ramp: below <code className="font-mono">x0</code> it is 0, above{" "}
